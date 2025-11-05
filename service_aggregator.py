@@ -31,12 +31,30 @@ class Service:
         self._log_handle = open(self.log_path, "a", encoding="utf-8")
         self._log_handle.write(f"\n=== START {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n"); self._log_handle.flush()
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+
+        # Decide how to launch the service depending on file type.
+        # - .py -> launch with the Python interpreter used to run this program
+        # - .exe -> run directly
+        # - otherwise -> try running directly
+        ext = Path(self.path).suffix.lower()
+        if ext == ".py":
+            cmd = [sys.executable, self.path]
+        elif ext == ".exe":
+            if os.name == "nt":
+                cmd = [self.path]
+            else:
+                # This tool is Windows-first; do not attempt to run .exe on non-Windows here.
+                raise RuntimeError(".exe support is Windows-only for this tool. Please run on Windows.")
+        else:
+            # Attempt to run directly (may fail if not executable)
+            cmd = [self.path]
+
         self.proc = subprocess.Popen(
-            [sys.executable, self.path],
+            cmd,
             stdout=self._log_handle,
             stderr=subprocess.STDOUT,
             creationflags=creationflags,
-            cwd=Path(self.path).parent  # <-- ensure script runs in its own folder
+            cwd=Path(self.path).parent  # <-- ensure service runs in its own folder
         )
         self.start_time = time.time()
         self.last_returncode = None
@@ -199,8 +217,8 @@ class ServiceAggregator(tk.Tk):
     # ---------- Actions ----------
     def add_service(self):
         path = filedialog.askopenfilename(
-            title="Select Python Script",
-            filetypes=[("Python Files", "*.py"), ("All Files", "*.*")]
+            title="Select Python script or Windows executable",
+            filetypes=[("All Files", "*.*")]
         )
         if not path: return
         if self._find_service_by_path(path):
