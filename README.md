@@ -1,5 +1,5 @@
-# Workaholic
-
+# Workaholic مرهق
+<img width="500" height="500" alt="شعار مرهق" src="https://github.com/user-attachments/assets/dd67bb4a-d6f4-4e3c-88e6-bd6615e684a0" />
 A small Tkinter GUI to manage multiple Python Scripts — start/stop/restart them, group them, and view logs.
 
 ## Requirements
@@ -13,6 +13,7 @@ A small Tkinter GUI to manage multiple Python Scripts — start/stop/restart the
    - macOS/Linux: run `python3 service_aggregator.py`
 
 ## Main features
+
 - Add / Remove Python scripts
 - Start / Stop / Restart a single service or multiple selected services
 - Start All / Stop All
