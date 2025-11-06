@@ -2,7 +2,9 @@
 <div align="center">
    <img width="250" height="250" alt="شعار مرهق" src="https://github.com/user-attachments/assets/dd67bb4a-d6f4-4e3c-88e6-bd6615e684a0" />
    <div style="display:inline-block; text-align:left; max-width:800px; margin-top:16px;">
-   
+
+   </div>
+</div>
 A small Tkinter GUI to manage multiple Python Scripts — start/stop/restart them, group them, and view logs.
 
 ## Requirements
@@ -34,5 +36,3 @@ A small Tkinter GUI to manage multiple Python Scripts — start/stop/restart the
 ## Contributing
 - Bug reports or small improvements welcome. This is a tool made for my personal use, but any suggestions are appreciated
 
-   </div>
-</div>
