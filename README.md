@@ -1,5 +1,8 @@
 # Workaholic مرهق
-<img width="500" height="500" alt="شعار مرهق" src="https://github.com/user-attachments/assets/dd67bb4a-d6f4-4e3c-88e6-bd6615e684a0" />
+<div align="center">
+   <img width="250" height="250" alt="شعار مرهق" src="https://github.com/user-attachments/assets/dd67bb4a-d6f4-4e3c-88e6-bd6615e684a0" />
+   <div style="display:inline-block; text-align:left; max-width:800px; margin-top:16px;">
+   
 A small Tkinter GUI to manage multiple Python Scripts — start/stop/restart them, group them, and view logs.
 
 ## Requirements
@@ -9,8 +12,8 @@ A small Tkinter GUI to manage multiple Python Scripts — start/stop/restart the
 ## Quick start
 1. Clone or copy this repo.
 2. Run:
-   - Windows: run `python service_aggregator.py`
-   - macOS/Linux: run `python3 service_aggregator.py`
+    - Windows: run `python service_aggregator.py`
+    - macOS/Linux: run `python3 service_aggregator.py`
 
 ## Main features
 
@@ -30,3 +33,6 @@ A small Tkinter GUI to manage multiple Python Scripts — start/stop/restart the
 
 ## Contributing
 - Bug reports or small improvements welcome. This is a tool made for my personal use, but any suggestions are appreciated
+
+   </div>
+</div>
