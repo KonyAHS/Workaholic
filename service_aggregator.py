@@ -1225,6 +1225,9 @@ class App(tk.Tk):
         self.img_list_on = make_checkbox(self, box, box + px(10), True, C.INPUT)
         self.logo = make_logo(self, px(26), C.SIDEBAR)
         self.iconphoto(True, *(make_logo(self, n, None) for n in (32, 16)))
+        icon = Path(getattr(sys, "_MEIPASS", APP_DIR)) / "assets" / "workaholic.ico"
+        if IS_WINDOWS and icon.is_file():
+            self.iconbitmap(default=str(icon))
 
     def _init_style(self):
         px = self.px

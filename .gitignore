@@ -6,3 +6,4 @@ build/
 dist/
 *.spec
 Workaholic.exe
+Workaholic.previous-*.exe
