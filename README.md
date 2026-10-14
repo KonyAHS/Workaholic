@@ -5,34 +5,55 @@
 
    </div>
 </div>
-A small Tkinter GUI to manage multiple Python Scripts — start/stop/restart them, group them, and view logs.
+A small desktop app to run your Python scripts and programs side by side — start/stop/restart them, group them, start them automatically, and watch their output live.
 
 ## Requirements
-- Python 3.10+ (uses `|` union types and modern stdlib features)
-- Tkinter available for your Python build (usually included on Windows/macOS; on some Linux distros you may need to install `python3-tk`)
+- Python 3.10+
+- Tkinter (included with Python on Windows/macOS; on some Linux distros install `python3-tk`)
 
 ## Quick start
-1. Clone or copy this repo.
-2. Run:
-    - Windows: run `python service_aggregator.py`
-    - macOS/Linux: run `python3 service_aggregator.py`
+- Windows executable: double-click `Workaholic.exe`. No batch file or Python installation is needed to run Workaholic itself. Keep `services_config.json` beside the executable to use your saved services and groups.
+- From source, first run `python -m pip install -r requirements.txt`.
+- Windows: `python service_aggregator.py` (or `pythonw service_aggregator.py` to run without a console window)
+- macOS/Linux: `python3 service_aggregator.py`
 
-## Main features
+## Features
+- **Add apps or services** — use the button in any view (or `Ctrl+N`). Search desktop apps from your Windows Start menu by name, select several, and click **Add selected**. Shortcut arguments and working folders are preserved. Use **Browse files** for scripts or apps without a Start menu shortcut. This list covers desktop shortcuts; Microsoft Store apps and URL shortcuts are not included.
+- **Services** — add `.py`, `.pyw`, `.exe`, `.bat`, `.cmd` and `.ps1` files (several at once). Give them a display name, arguments, a specific Python interpreter (e.g. a venv), working folder, and optionally auto-restart them when they crash.
+- **Already running** — before starting, Workaholic checks for the same executable path or script path. An existing process is shown as **Running elsewhere**, and no duplicate is started. Those processes remain running when Workaholic closes; stop/restart them from their own apps. Different Python scripts are checked separately. Processes whose paths or command lines Windows restricts cannot always be identified.
+- **Live output** — select a service to stream its log in the output panel; errors and warnings are highlighted.
+- **Groups** — create a group from the sidebar `+` (or from selected services via right-click → Groups). Pick which services belong to it, set their start order with the arrows, and set a delay between starts.
+- **Startup** — tick *Start on launch* on any group to start it when Workaholic opens; groups start in sidebar order. In *Settings* you can launch Workaholic when you sign in to Windows (optionally minimized) and choose how long to wait before autostart begins.
+- **Single instance** — launching Workaholic again just brings the existing window to the front.
 
-- Add / Remove Python scripts
-- Start / Stop / Restart a single service or multiple selected services
-- Start All / Stop All
-- Create named groups of services and Start Group
-- Mark groups as Autostart — autostart groups run at app startup
-- Open service logs (each service writes to a `.log` file next to the script)
-- Persistent config saved to [services_config.json](services_config.json) (path controlled by [`CONFIG_FILE`](service_aggregator.py))
+### Keyboard shortcuts
+| Keys | Action |
+| --- | --- |
+| `Ctrl+N` | Add services |
+| `Ctrl+G` | New group (pre-filled with the selection) |
+| `Ctrl+F` | Search |
+| `Enter` | Start / stop selection |
+| `Ctrl+R` | Restart selection |
+| `F2` | Edit service |
+| `Del` | Remove from Workaholic |
+| `Ctrl+,` | Settings |
+
+### Command-line options
+- `--minimized` — start minimized
+- `--no-autostart` — skip autostart groups this time
+- `--startup` — used by the sign-in entry; honours the *Start minimized* setting
 
 ## Notes & behavior
-- Services are launched with the same Python interpreter running the GUI (`sys.executable`), and each service's working directory is set to the script's folder.
-- Logs: when a service starts, output (stdout/stderr) is appended to `<script>.log` in the same directory as the script.
-- Windows: the code uses process group/CTRL_BREAK handing to try a graceful stop; on other OSes it sends SIGTERM then SIGKILL if needed.
-- If a service path is missing, the UI marks it as MISSING. Remove or update paths via the UI.
+- `.py` services need an installed Python interpreter even with the compiled app. Source mode uses Workaholic's interpreter; the executable finds Python on PATH. Set a specific interpreter in **Edit service** for virtual environments. Each service runs in its own folder unless a working folder is set.
+- Script output (stdout/stderr) is appended to `<script>.log` next to the file. Executable logs go in `%LOCALAPPDATA%\Workaholic\logs` so apps under Program Files can start without write-permission errors. Output from apps already running elsewhere is not captured.
+- Stopping sends a graceful signal first (Ctrl+Break on Windows, SIGTERM elsewhere), then kills the whole process tree after a few seconds. Stopping never freezes the window.
+- Configuration is saved to `services_config.json` next to the app. Configs from older versions are upgraded automatically.
+- The sign-in option writes a `Workaholic` entry under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`; turning it off removes it.
 
 ## Contributing
 - Bug reports or small improvements welcome. This is a tool made for my personal use, but any suggestions are appreciated
 
+## Build the Windows executable
+Run `powershell -ExecutionPolicy Bypass -File .\build.ps1` from this folder. This installs psutil and PyInstaller and creates a single `Workaholic.exe` beside your configuration. The executable runs without a console window. Rebuild after changing the source.
+
+Process checks: `python -m unittest test_services -v`.

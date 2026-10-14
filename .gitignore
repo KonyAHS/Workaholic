@@ -1,2 +1,8 @@
 *.json
 *.bat
+*.json.tmp
+__pycache__/
+build/
+dist/
+*.spec
+Workaholic.exe
