@@ -186,10 +186,20 @@ def suggested_service_name(path: str) -> str:
 def process_snapshot() -> list[dict]:
     """Inspect accessible processes; restricted processes must not break launching."""
     result = []
-    for proc in psutil.process_iter(["pid", "exe", "cmdline", "cwd", "create_time"], ad_value=None):
+    for proc in psutil.process_iter(["pid", "name", "exe", "cmdline", "cwd", "create_time"], ad_value=None):
         if proc.pid != os.getpid():
             result.append(proc.info)
     return result
+
+
+def trigger_process_running(target: str, processes: list[dict]) -> bool:
+    """Match an executable name, or an exact path when a folder is specified."""
+    target = target.strip().strip('"')
+    if not target: return False
+    if os.path.dirname(target):
+        return any(info.get("exe") and norm(info["exe"]) == norm(target) for info in processes)
+    return any(target.casefold() == (info.get("name") or Path(info.get("exe") or "").name).casefold()
+               for info in processes)
 
 
 def matching_process(path: str, processes: list[dict]) -> dict | None:
@@ -441,6 +451,7 @@ class Group:
     services: list[str] = field(default_factory=list)  # paths, in start order
     autostart: bool = False
     start_delay: float = 1.0                           # seconds between starting each service
+    trigger_process: str = ""                         # executable name or full path; empty disables
 
 
 @dataclass
@@ -868,6 +879,12 @@ class GroupDialog(Dialog):
         self.autostart_var = tk.BooleanVar(self, value=group.autostart if group else False)
         ttk.Checkbutton(self.body, text="Start this group automatically when Workaholic opens",
                         variable=self.autostart_var).pack(anchor="w")
+        trigger_row = self.field("Start when this process runs",
+                                 "Optional: enter a name such as ffxiv_dx11.exe, or browse for an executable. "
+                                 "Workaholic must stay open. Closing the process leaves the group running.")
+        self.trigger_var = tk.StringVar(self, value=group.trigger_process if group else "")
+        ttk.Entry(trigger_row, textvariable=self.trigger_var).pack(side="left", fill="x", expand=True)
+        ttk.Button(trigger_row, text="Browse…", command=self._browse_trigger).pack(side="left", padx=(px(8), 0))
         delay_row = tk.Frame(self.body, bg=C.BG)
         delay_row.pack(fill="x", pady=(px(10), 0))
         tk.Label(delay_row, text="Wait", fg=C.TEXT, bg=C.BG, font=app.f_base).pack(side="left")
@@ -879,6 +896,11 @@ class GroupDialog(Dialog):
 
         self.add_buttons("Save" if group else "Create group")
         self._render()
+
+    def _browse_trigger(self):
+        path = filedialog.askopenfilename(parent=self, title="Choose the process that starts this group",
+                                          filetypes=[("Programs", "*.exe"), ("All files", "*.*")])
+        if path: self.trigger_var.set(path)
 
     def _render(self, select: str | None = None):
         select = select or self.tree.focus()
@@ -921,7 +943,8 @@ class GroupDialog(Dialog):
         except ValueError:
             return self.fail("The delay must be a number between 0 and 600 seconds.")
         return Group(name=name, services=[s.path for s in self.order if s.id in self.checked],
-                     autostart=self.autostart_var.get(), start_delay=delay)
+                     autostart=self.autostart_var.get(), start_delay=delay,
+                     trigger_process=self.trigger_var.get().strip().strip('"'))
 
 
 class AddServiceDialog(Dialog):
@@ -1143,6 +1166,8 @@ class App(tk.Tk):
         self._process_check_at = 0.0
         self._process_results = queue.Queue()
         self._process_scan_pending = False
+        self._trigger_states: dict[int, tuple[str, bool]] = {}
+        self._group_restart_tokens: dict[int, object] = {}
 
         self._load_config()
         self._init_fonts()
@@ -1586,6 +1611,7 @@ class App(tk.Tk):
             Tooltip(cb, "Start this group automatically when Workaholic opens")
             btn("✎  Edit", lambda: self.edit_group(g), tip="Choose services, order and startup options")
             btn("■  Stop", lambda: self.stop_group(g), tip="Stop every service in this group")
+            btn("↻  Restart all", lambda: self.restart_group(g), tip="Restart this group's services in order")
             btn("▶  Start group", lambda: self.start_group(g), "Accent.TButton",
                 f"Start in order, {g.start_delay:g}s apart")
         else:
@@ -1602,6 +1628,7 @@ class App(tk.Tk):
             title = g.name
             parts = [f"{r} of {len(members)} running" if members else "No services in this group"]
             if g.autostart: parts.append("starts on launch")
+            if g.trigger_process: parts.append(f"starts with {Path(g.trigger_process).name}")
             if len(members) > 1: parts.append(f"{g.start_delay:g}s between services")
             sub = "  ·  ".join(parts)
         elif kind == "running":
@@ -1774,6 +1801,7 @@ class App(tk.Tk):
         self._menu_vars = [var]
         m.add_command(label="Start group", command=lambda: self.start_group(g))
         m.add_command(label="Stop group", command=lambda: self.stop_group(g))
+        m.add_command(label="Restart all in group", command=lambda: self.restart_group(g))
         m.add_separator()
         m.add_checkbutton(label="Start on launch", variable=var,
                           command=lambda: self.set_group_autostart(g, var.get()))
@@ -1892,6 +1920,7 @@ class App(tk.Tk):
         self._start_sequence([(s, 0) for s in self.services], "Start all", interactive=True)
 
     def stop_all(self):
+        self._group_restart_tokens.clear()
         active = [s for s in self.services if (s.is_active or s.restart_at) and not s.external]
         for s in active:
             s.restart_pending = False
@@ -1911,7 +1940,8 @@ class App(tk.Tk):
     def _names(services: list[Service]) -> str:
         return f"“{services[0].display_name}”" if len(services) == 1 else f"{len(services)} services"
 
-    def _start_sequence(self, items: list[tuple[Service, float]], label: str, interactive: bool = False):
+    def _start_sequence(self, items: list[tuple[Service, float]], label: str, interactive: bool = False,
+                        still_valid=None):
         """Start services one after another, waiting each item's delay before the next."""
         items = [(s, d) for s, d in items if not s.is_active]
         if not items:
@@ -1924,7 +1954,7 @@ class App(tk.Tk):
 
         def step():
             nonlocal pos, skipped
-            if self._closing or self._destroyed: return
+            if self._closing or self._destroyed or (still_valid and not still_valid()): return
             s, delay = items[pos]
             pos += 1
             if s in self.services and not s.is_active:
@@ -1964,6 +1994,7 @@ class App(tk.Tk):
         if not result: return
         g.name, g.services, g.autostart, g.start_delay = (result.name, result.services, result.autostart,
                                                          result.start_delay)
+        g.trigger_process = result.trigger_process
         self._save_config()
         self.render_sidebar()
         if self.view[1] is g: self._render_header()
@@ -1975,6 +2006,8 @@ class App(tk.Tk):
                                    detail="The services in it are kept.", icon="warning", parent=self):
             return
         self.groups.remove(g)
+        self._group_restart_tokens.pop(id(g), None)
+        self._trigger_states.pop(id(g), None)
         self._save_config()
         self.render_sidebar()
         if self.view[1] is g: self.set_view("all")
@@ -2016,12 +2049,54 @@ class App(tk.Tk):
         self._start_sequence([(s, g.start_delay) for s in members], f"“{g.name}”", interactive=True)
 
     def stop_group(self, g: Group):
+        self._group_restart_tokens.pop(id(g), None)
         active = [s for s in self.group_services(g) if (s.is_active or s.restart_at) and not s.external]
         for s in active:
             s.restart_pending = False
             s.stop()
         self.flash(f"Stopping “{g.name}”…" if active else f"Nothing in “{g.name}” is running.")
         self._refresh()
+
+    def restart_group(self, g: Group):
+        members = [s for s in self.group_services(g) if not s.external]
+        if not members:
+            self.flash(f"No services in “{g.name}” can be restarted here.", "warn")
+            return
+        token = object()
+        self._group_restart_tokens[id(g)] = token
+        for s in members:
+            s.restart_pending = False
+            s.stop()
+        self.flash(f"Restarting “{g.name}”…")
+        self._refresh()
+
+        def resume():
+            if self._closing or self._destroyed or self._group_restart_tokens.get(id(g)) is not token:
+                return
+            if any(s.is_active for s in members):
+                self.after(TICK_MS, resume)
+                return
+            current = self.group_services(g)
+            self._start_sequence([(s, g.start_delay) for s in members if s in self.services and s in current],
+                                 f"Restart “{g.name}”", interactive=True,
+                                 still_valid=lambda: self._group_restart_tokens.get(id(g)) is token)
+        resume()
+
+    def _check_process_triggers(self, processes: list[dict]):
+        if self._closing or self.opts.no_autostart: return
+        items, seen, names = [], set(), []
+        for g in self.groups:
+            target = g.trigger_process
+            running = trigger_process_running(target, processes)
+            previous_target, was_running = self._trigger_states.get(id(g), ("", False))
+            self._trigger_states[id(g)] = (target, running)
+            if not running or (previous_target == target and was_running): continue
+            names.append(g.name)
+            for s in self.group_services(g):
+                if s.id not in seen:
+                    seen.add(s.id)
+                    items.append((s, g.start_delay))
+        if items: self._start_sequence(items, "Process startup: " + ", ".join(names))
 
     def run_autostart(self):
         seen, items, names = set(), [], []
@@ -2188,6 +2263,7 @@ class App(tk.Tk):
                 self._process_scan_pending = False
                 if processes is not None:
                     for service in self.services: service.detect_existing(processes)
+                    self._check_process_triggers(processes)
             if now >= self._process_check_at and not self._process_scan_pending and not self._closing:
                 self._process_scan_pending = True
                 self._process_check_at = now + 2.0
@@ -2285,7 +2361,8 @@ class App(tk.Tk):
             except (TypeError, ValueError): delay = 1.0
             self.groups.append(Group(name=str(entry["name"]),
                                      services=[p for p in entry.get("services", []) or [] if isinstance(p, str)],
-                                     autostart=bool(entry.get("autostart", False)), start_delay=delay))
+                                     autostart=bool(entry.get("autostart", False)), start_delay=delay,
+                                     trigger_process=str(entry.get("trigger_process") or "")))
 
         raw_settings = data.get("settings", {}) or {}
         for f in fields(Settings):
@@ -2354,7 +2431,7 @@ def main():
     parser.add_argument("--startup", action="store_true",
                         help="launched at sign-in (honours the 'start minimized' setting)")
     parser.add_argument("--minimized", action="store_true", help="start minimized")
-    parser.add_argument("--no-autostart", action="store_true", help="don't start autostart groups this time")
+    parser.add_argument("--no-autostart", action="store_true", help="skip launch and process-triggered group startup this time")
     opts = parser.parse_args()
 
     instance = acquire_single_instance()

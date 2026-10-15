@@ -23,6 +23,8 @@ A small desktop app to run your Python scripts and programs side by side — sta
 - **Already running** — before starting, Workaholic checks for the same executable path or script path. An existing process is shown as **Running elsewhere**, and no duplicate is started. Those processes remain running when Workaholic closes; stop/restart them from their own apps. Different Python scripts are checked separately. Processes whose paths or command lines Windows restricts cannot always be identified.
 - **Live output** — select a service to stream its log in the output panel; errors and warnings are highlighted.
 - **Groups** — create a group from the sidebar `+` (or from selected services via right-click → Groups). Pick which services belong to it, set their start order with the arrows, and set a delay between starts.
+- **Restart a group** — click **Restart all** in the group, or right-click its sidebar entry → **Restart all in group**. Workaholic stops the services it owns, waits for them to stop, then starts the group in order with its configured delay. Apps running elsewhere are left alone.
+- **Start with a game or app** — edit a group and set **Start when this process runs** to an executable name such as `ffxiv_dx11.exe`, or browse for its exact executable path. Clear the field to disable it. While Workaholic is open, it checks about every two seconds and starts the group once when the process is detected (including if it is already running). The trigger resets after the process exits. Closing the game leaves the group running; manually stopping a group keeps it stopped until the next game session.
 - **Startup** — tick *Start on launch* on any group to start it when Workaholic opens; groups start in sidebar order. In *Settings* you can launch Workaholic when you sign in to Windows (optionally minimized) and choose how long to wait before autostart begins.
 - **Single instance** — launching Workaholic again just brings the existing window to the front.
 
@@ -40,7 +42,7 @@ A small desktop app to run your Python scripts and programs side by side — sta
 
 ### Command-line options
 - `--minimized` — start minimized
-- `--no-autostart` — skip autostart groups this time
+- `--no-autostart` — skip launch and process-triggered group startup this time
 - `--startup` — used by the sign-in entry; honours the *Start minimized* setting
 
 ## Notes & behavior
