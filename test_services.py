@@ -6,7 +6,8 @@ from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from service_aggregator import App, Group, Service, matching_process, process_snapshot, trigger_process_running
+from service_aggregator import (App, Group, Service, icon_sources, matching_process, parse_icon_spec, png_bytes,
+                                process_snapshot, program_choices, trigger_process_running)
 
 
 class GroupChecks(unittest.TestCase):
@@ -121,6 +122,43 @@ class ProcessChecks(unittest.TestCase):
         from service_aggregator import default_python
         with patch.object(sys, "frozen", True, create=True), patch("shutil.which", return_value="C:/Python/python.exe"):
             self.assertEqual(default_python(), "C:/Python/python.exe")
+
+
+class IconChecks(unittest.TestCase):
+    def test_icon_spec_keeps_commas_in_paths(self):
+        self.assertEqual(parse_icon_spec(r"C:\Icons\a,b.dll,12"), (r"C:\Icons\a,b.dll", 12))
+        self.assertEqual(parse_icon_spec(r'"C:\Icons\app.ico"'), (r"C:\Icons\app.ico", 0))
+        with patch.dict("os.environ", {"SystemRoot": r"C:\Windows"}):
+            self.assertEqual(parse_icon_spec(r"%SystemRoot%\System32\imageres.dll,3"),
+                             (r"C:\Windows\System32\imageres.dll", 3))
+
+    def test_scripts_use_their_runner_and_a_chosen_icon_comes_first(self):
+        with patch("shutil.which", side_effect=lambda name: None):
+            self.assertEqual(icon_sources("tool.exe"), ["tool.exe"])
+            self.assertEqual(icon_sources("job.ps1"), ["powershell.exe"])
+            self.assertEqual(icon_sources("job.bat", icon="x.dll,2"), ["x.dll,2", "cmd.exe"])
+            self.assertEqual(icon_sources("bot.py", "C:/venv/python.exe")[0], "C:/venv/python.exe")
+
+    def test_icon_choice_is_saved(self):
+        self.assertEqual(Service("tool.exe", icon="x.dll,2").to_dict()["icon"], "x.dll,2")
+
+    def test_png_has_valid_structure(self):
+        data = png_bytes(2, 1, bytes([255, 0, 0, 255, 0, 0, 0, 0]))
+        self.assertTrue(data.startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertTrue(data.endswith(b"IEND\xaeB`\x82"))
+
+
+class RunningAppChecks(unittest.TestCase):
+    def test_windows_first_then_background_programs_once(self):
+        processes = [{"pid": 1, "name": "game.exe", "exe": "C:/Games/game.exe"},
+                     {"pid": 2, "name": "game.exe", "exe": "C:/Games/game.exe"},
+                     {"pid": 3, "name": "agent.exe", "exe": "C:/Tools/agent.exe"},
+                     {"pid": 4, "name": "Bot.exe", "exe": None}]
+        windows = [(1, "Game"), (9, "Gone already")]
+        self.assertEqual(program_choices(windows, processes, False),
+                         [{"title": "Game", "name": "game.exe", "exe": "C:/Games/game.exe"}])
+        names = [c["name"] for c in program_choices(windows, processes, True)]
+        self.assertEqual(names, ["game.exe", "agent.exe", "Bot.exe"])
 
 
 if __name__ == "__main__":

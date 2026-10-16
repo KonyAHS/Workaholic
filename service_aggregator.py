@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import codecs
+import functools
 import itertools
 import json
 import os
@@ -12,16 +14,19 @@ import shlex
 import shutil
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import threading
 import time
+import zlib
 import tkinter as tk
 import tkinter.font as tkfont
 import hashlib
 import psutil
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
+from types import SimpleNamespace
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "Workaholic"
@@ -39,34 +44,49 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
 
 class C:
-    """Colour palette."""
-    BG = "#16171b"
-    SIDEBAR = "#0f1013"
-    PANEL = "#1b1c21"
-    PANEL_ALT = "#1e1f25"
-    INPUT = "#202228"
-    LOG_BG = "#121317"
-    BUTTON = "#25272e"
-    BUTTON_HOVER = "#2e3139"
-    BUTTON_PRESS = "#363944"
-    BORDER = "#2a2c33"
-    BORDER_STRONG = "#3b3e48"
-    NAV_HOVER = "#191b20"
-    NAV_SELECTED = "#1f2229"
-    SELECT = "#263450"
-    TEXT = "#e7e9ee"
-    LOG_TEXT = "#c9ccd3"
-    MUTED = "#9ba1ad"
-    DIM = "#666c78"
-    ACCENT = "#5b8cff"
-    ACCENT_HOVER = "#739dff"
-    ACCENT_PRESS = "#4a78e6"
-    WHITE = "#ffffff"
-    GREEN = "#3fb950"
-    AMBER = "#d29922"
-    RED = "#f2545b"
-    BLUE = "#58a6ff"
-    GREY = "#5d636e"
+    """Colour palette, taken from the app icon: forest green on warm ivory."""
+    BG = "#f8f1e4"
+    PANEL = "#fffaf1"
+    PANEL_ALT = "#fbf4e8"
+    INPUT = "#fffcf7"
+    FOOTER = "#f1e6d2"
+    BUTTON = "#f1e7d6"
+    BUTTON_HOVER = "#e8dcc6"
+    BUTTON_PRESS = "#ddcfb5"
+    BORDER = "#e6dac6"
+    BORDER_STRONG = "#cdbea4"
+    SELECT = "#dbe7de"
+    TEXT = "#22332e"
+    MUTED = "#5e6c66"
+    DIM = "#8b928a"
+    ACCENT = "#32534b"
+    ACCENT_HOVER = "#3d6359"
+    ACCENT_PRESS = "#2a463f"
+    ON_ACCENT = "#f9eedc"
+    GREEN = "#2e8a57"
+    AMBER = "#b7791f"
+    RED = "#c0453b"
+    BLUE = "#3b6e9e"
+    GREY = "#aaa08f"
+    # Sidebar, title bar and tooltips use the icon's green.
+    SIDEBAR = "#2c4a43"
+    NAV_HOVER = "#35554d"
+    NAV_SELECTED = "#3f6158"
+    SIDE_TEXT = "#f9eedc"
+    SIDE_MUTED = "#bfcdc4"
+    SIDE_DIM = "#8fa79d"
+    SIDE_ACCENT = "#e3c99a"
+    SIDE_GREEN = "#9ee0b3"
+    SIDE_AMBER = "#f2c879"
+    # Output panel: a dark green console.
+    LOG_BG = "#243d37"
+    LOG_TEXT = "#ece2cf"
+    LOG_SELECT = "#44665c"
+    LOG_THUMB = "#4a6a61"
+    LOG_MARKER = "#a8d8b9"
+    LOG_ERROR = "#ff9e90"
+    LOG_WARN = "#f2c879"
+    LOG_HINT = "#9fb5ab"
 
 
 STATUS_COLORS = {
@@ -267,11 +287,195 @@ ConvertTo-Json -InputObject $apps -Compress
     return sorted(unique.values(), key=lambda a: a["name"].casefold())
 
 
+def program_choices(windows: list[tuple[int, str]], processes: list[dict], background: bool) -> list[dict]:
+    """Windowed programs first (in window order), then optionally every other program once."""
+    by_pid = {info.get("pid"): info for info in processes}
+    choices, seen = [], set()
+    for pid, title in windows:
+        info = by_pid.get(pid)
+        name = info and (info.get("name") or Path(info.get("exe") or "").name)
+        if not name: continue
+        choices.append({"title": title, "name": name, "exe": info.get("exe") or ""})
+        seen.add((info.get("exe") or name).casefold())
+    if background:
+        rest = {}
+        for info in processes:
+            name = info.get("name") or Path(info.get("exe") or "").name
+            key = (info.get("exe") or name).casefold()
+            if name and key not in seen and key not in rest:
+                rest[key] = {"title": "", "name": name, "exe": info.get("exe") or ""}
+        choices += sorted(rest.values(), key=lambda c: c["name"].casefold())
+    return choices
+
+
+# ---------- Icons ----------
+WINDOWS_ICON_LIBRARIES = (("Windows", r"%SystemRoot%\System32\imageres.dll"),
+                          ("Classic", r"%SystemRoot%\System32\shell32.dll"))
+
+
+def icon_sources(path: str, interpreter: str = "", icon: str = "") -> list[str]:
+    """Icon specs to try for a service, best first: its chosen icon, then the program that runs it."""
+    ext = Path(path).suffix.lower()
+    if ext in (".py", ".pyw"): runners = [interpreter, default_python(), "py.exe"]
+    elif ext == ".ps1": runners = ["powershell.exe"]
+    elif ext in (".bat", ".cmd"): runners = ["cmd.exe"]
+    else: runners = [path]
+    return ([icon] if icon else []) + [shutil.which(r) or r for r in runners if r]
+
+
+def parse_icon_spec(spec: str) -> tuple[str, int]:
+    """'C:\\file.dll,12' -> (path, 12). A bare path means its first icon."""
+    path, sep, index = spec.rpartition(",")
+    if sep and index.strip().isdigit():
+        return os.path.expandvars(path.strip().strip('"')), int(index)
+    return os.path.expandvars(spec.strip().strip('"')), 0
+
+
+def png_bytes(w: int, h: int, rgba: bytes) -> bytes:
+    stride = w * 4
+    raw = b"".join(b"\x00" + bytes(rgba[y * stride:(y + 1) * stride]) for y in range(h))
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+
+def photo(master, w: int, h: int, rgba: bytes) -> tk.PhotoImage:
+    """PhotoImage with a real alpha channel, so it blends into any row or background."""
+    return tk.PhotoImage(master=master, data=base64.b64encode(png_bytes(w, h, rgba)), format="png")
+
+
+@functools.cache
+def _win32() -> SimpleNamespace:
+    """Win32 functions for reading icons and listing windows, bound with explicit types."""
+    import ctypes
+    from ctypes import wintypes as w
+
+    class ICONINFO(ctypes.Structure):
+        _fields_ = [("fIcon", w.BOOL), ("xHotspot", w.DWORD), ("yHotspot", w.DWORD),
+                    ("hbmMask", w.HBITMAP), ("hbmColor", w.HBITMAP)]
+
+    class BITMAPINFOHEADER(ctypes.Structure):
+        _fields_ = [("biSize", w.DWORD), ("biWidth", w.LONG), ("biHeight", w.LONG), ("biPlanes", w.WORD),
+                    ("biBitCount", w.WORD), ("biCompression", w.DWORD), ("biSizeImage", w.DWORD),
+                    ("biXPelsPerMeter", w.LONG), ("biYPelsPerMeter", w.LONG), ("biClrUsed", w.DWORD),
+                    ("biClrImportant", w.DWORD)]
+
+    user32, gdi32, dwmapi = ctypes.WinDLL("user32"), ctypes.WinDLL("gdi32"), ctypes.WinDLL("dwmapi")
+    enum_proc = ctypes.WINFUNCTYPE(w.BOOL, w.HWND, w.LPARAM)
+
+    def bind(fn, restype, *argtypes):
+        fn.restype, fn.argtypes = restype, list(argtypes)
+        return fn
+
+    return SimpleNamespace(
+        ctypes=ctypes, w=w, ICONINFO=ICONINFO, BITMAPINFOHEADER=BITMAPINFOHEADER, WNDENUMPROC=enum_proc,
+        extract_icons=bind(user32.PrivateExtractIconsW, w.UINT, w.LPCWSTR, ctypes.c_int, ctypes.c_int,
+                           ctypes.c_int, ctypes.POINTER(w.HICON), ctypes.POINTER(w.UINT), w.UINT, w.UINT),
+        get_icon_info=bind(user32.GetIconInfo, w.BOOL, w.HICON, ctypes.POINTER(ICONINFO)),
+        destroy_icon=bind(user32.DestroyIcon, w.BOOL, w.HICON),
+        get_dc=bind(user32.GetDC, w.HDC, w.HWND),
+        release_dc=bind(user32.ReleaseDC, ctypes.c_int, w.HWND, w.HDC),
+        get_dibits=bind(gdi32.GetDIBits, ctypes.c_int, w.HDC, w.HBITMAP, w.UINT, w.UINT, ctypes.c_void_p,
+                        ctypes.POINTER(BITMAPINFOHEADER), w.UINT),
+        delete_object=bind(gdi32.DeleteObject, w.BOOL, w.HGDIOBJ),
+        enum_windows=bind(user32.EnumWindows, w.BOOL, enum_proc, w.LPARAM),
+        is_visible=bind(user32.IsWindowVisible, w.BOOL, w.HWND),
+        get_owner=bind(user32.GetWindow, w.HWND, w.HWND, w.UINT),
+        get_ex_style=bind(user32.GetWindowLongW, w.LONG, w.HWND, ctypes.c_int),
+        text_length=bind(user32.GetWindowTextLengthW, ctypes.c_int, w.HWND),
+        get_text=bind(user32.GetWindowTextW, ctypes.c_int, w.HWND, w.LPWSTR, ctypes.c_int),
+        get_class=bind(user32.GetClassNameW, ctypes.c_int, w.HWND, w.LPWSTR, ctypes.c_int),
+        get_pid=bind(user32.GetWindowThreadProcessId, w.DWORD, w.HWND, ctypes.POINTER(w.DWORD)),
+        dwm_attribute=bind(dwmapi.DwmGetWindowAttribute, ctypes.c_long, w.HWND, w.DWORD, ctypes.c_void_p, w.DWORD),
+    )
+
+
+def _icon_pixels(api: SimpleNamespace, hicon, size: int) -> bytearray | None:
+    """RGBA pixels of an icon handle."""
+    ctypes = api.ctypes
+    info = api.ICONINFO()
+    if not api.get_icon_info(hicon, ctypes.byref(info)): return None
+    hdc = api.get_dc(None)
+    try:
+        if not info.hbmColor: return None   # monochrome icons are too rare to bother with
+        header = api.BITMAPINFOHEADER(biSize=ctypes.sizeof(api.BITMAPINFOHEADER), biWidth=size, biHeight=-size,
+                                      biPlanes=1, biBitCount=32)
+        buf = ctypes.create_string_buffer(size * size * 4)
+        if api.get_dibits(hdc, info.hbmColor, 0, size, buf, ctypes.byref(header), 0) != size: return None
+        pixels = bytearray(buf.raw)
+        if not any(pixels[3::4]):   # older icons have no alpha channel and use their mask instead
+            mask = ctypes.create_string_buffer(size * size * 4)
+            header.biBitCount, header.biCompression = 32, 0
+            if api.get_dibits(hdc, info.hbmMask, 0, size, mask, ctypes.byref(header), 0) != size: return None
+            pixels[3::4] = bytes(0 if m else 255 for m in mask.raw[0::4])
+    finally:
+        api.release_dc(None, hdc)
+        for bitmap in (info.hbmColor, info.hbmMask):
+            if bitmap: api.delete_object(bitmap)
+    pixels[0::4], pixels[2::4] = pixels[2::4], pixels[0::4]   # BGRA -> RGBA
+    return pixels
+
+
+def icon_count(path: str) -> int:
+    if not IS_WINDOWS or not Path(path).is_file(): return 0
+    n = _win32().extract_icons(path, 0, 0, 0, None, None, 0, 0)
+    return 0 if n == 0xFFFFFFFF else n
+
+
+def load_icons(path: str, size: int, start: int = 0, count: int = 1) -> list[bytearray | None]:
+    """RGBA pixels for icons in an .exe, .dll or .ico file, scaled by Windows to `size`."""
+    if not IS_WINDOWS or count < 1 or not Path(path).is_file(): return []
+    api = _win32()
+    handles = (api.w.HICON * count)()
+    ids = (api.w.UINT * count)()
+    n = api.extract_icons(path, start, size, size, handles, ids, count, 0)
+    if n == 0xFFFFFFFF: return []
+    result = []
+    for handle in handles[:n]:
+        if not handle:
+            result.append(None)
+            continue
+        try: result.append(_icon_pixels(api, handle, size))
+        finally: api.destroy_icon(handle)
+    return result
+
+
+def visible_windows() -> list[tuple[int, str]]:
+    """(pid, title) of top-level app windows — the same kind of list OBS shows for game capture."""
+    if not IS_WINDOWS: return []
+    api = _win32()
+    ctypes = api.ctypes
+    found = []
+
+    def visit(hwnd, _):
+        if not api.is_visible(hwnd) or api.get_owner(hwnd, 4): return True    # GW_OWNER: dialogs, popups
+        if api.get_ex_style(hwnd, -20) & 0x80: return True                      # WS_EX_TOOLWINDOW
+        cloaked = api.w.DWORD()
+        if api.dwm_attribute(hwnd, 14, ctypes.byref(cloaked), ctypes.sizeof(cloaked)) == 0 and cloaked.value:
+            return True                                                          # DWMWA_CLOAKED: hidden UWP
+        length = api.text_length(hwnd)
+        if not length: return True
+        title = ctypes.create_unicode_buffer(length + 1)
+        api.get_text(hwnd, title, length + 1)
+        cls = ctypes.create_unicode_buffer(64)
+        api.get_class(hwnd, cls, 64)
+        if cls.value in ("Progman", "WorkerW", "Shell_TrayWnd"): return True
+        pid = api.w.DWORD()
+        api.get_pid(hwnd, ctypes.byref(pid))
+        found.append((pid.value, title.value))
+        return True
+
+    api.enum_windows(api.WNDENUMPROC(visit), 0)
+    return found
+
+
 class Service:
     _ids = itertools.count(1)
 
     def __init__(self, path: str, name: str = "", args: str = "", interpreter: str = "",
-                 auto_restart: bool = False, working_dir: str = ""):
+                 auto_restart: bool = False, working_dir: str = "", icon: str = ""):
         self.id = f"svc{next(Service._ids)}"
         self.path = path
         self.name = name or suggested_service_name(path)
@@ -279,6 +483,7 @@ class Service:
         self.interpreter = interpreter
         self.auto_restart = auto_restart
         self.working_dir = working_dir
+        self.icon = icon                     # "file,index" chosen by the user; empty = the program's own
         self.external: dict | None = None
         self.proc: subprocess.Popen | None = None
         self.start_time: float | None = None
@@ -442,7 +647,7 @@ class Service:
     def to_dict(self):
         return {"path": self.path, "name": self.name, "args": self.args,
                 "interpreter": self.interpreter, "auto_restart": self.auto_restart,
-                "working_dir": self.working_dir}
+                "working_dir": self.working_dir, "icon": self.icon}
 
 
 @dataclass
@@ -503,7 +708,8 @@ def enable_dpi_awareness():
         pass
 
 
-def apply_dark_titlebar(win: tk.Misc, caption: str = C.BG):
+def apply_titlebar(win: tk.Misc):
+    """Colour the Windows 11 title bar in the icon's green, with ivory text."""
     if not IS_WINDOWS: return
     try:
         import ctypes
@@ -512,9 +718,10 @@ def apply_dark_titlebar(win: tk.Misc, caption: str = C.BG):
         on = ctypes.c_int(1)
         if set_attr(hwnd, 20, ctypes.byref(on), ctypes.sizeof(on)) != 0:  # DWMWA_USE_IMMERSIVE_DARK_MODE
             set_attr(hwnd, 19, ctypes.byref(on), ctypes.sizeof(on))
-        r, g, b = (int(caption[i:i + 2], 16) for i in (1, 3, 5))
-        color = ctypes.c_int(b << 16 | g << 8 | r)
-        set_attr(hwnd, 35, ctypes.byref(color), ctypes.sizeof(color))   # DWMWA_CAPTION_COLOR (Win11)
+        for attr, color in ((34, C.SIDEBAR), (35, C.SIDEBAR), (36, C.SIDE_TEXT)):  # border, caption, text
+            r, g, b = hex_rgb(color)
+            value = ctypes.c_int(b << 16 | g << 8 | r)
+            set_attr(hwnd, attr, ctypes.byref(value), ctypes.sizeof(value))
     except Exception:
         pass
 
@@ -546,12 +753,11 @@ def hex_rgb(color: str) -> tuple[int, int, int]:
     return int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16)
 
 
-def raster(master, w: int, h: int, layers, bg: str | None = None, ss: int = 4) -> tk.PhotoImage:
-    """Rasterise shapes into a PhotoImage with supersampled edges blended into `bg`."""
-    img = tk.PhotoImage(master=master, width=w, height=h)
-    bg_rgb = hex_rgb(bg) if bg else None
+def raster(master, w: int, h: int, layers, ss: int = 4) -> tk.PhotoImage:
+    """Rasterise shapes into a PhotoImage with supersampled, alpha-blended edges."""
     layers = [(hex_rgb(color), inside) for color, inside in layers]
     n = ss * ss
+    pixels = bytearray(w * h * 4)
     for y in range(h):
         for x in range(w):
             r = g = b = hits = 0
@@ -563,16 +769,10 @@ def raster(master, w: int, h: int, layers, bg: str | None = None, ss: int = 4) -
                         if inside(fx, fy): col = c
                     if col:
                         r += col[0]; g += col[1]; b += col[2]; hits += 1
-            if not hits: continue
-            if hits < n and bg_rgb:
-                miss = n - hits
-                r, g, b = (r + bg_rgb[0] * miss) / n, (g + bg_rgb[1] * miss) / n, (b + bg_rgb[2] * miss) / n
-            elif hits < n / 2:
-                continue
-            else:
-                r, g, b = r / hits, g / hits, b / hits
-            img.put(f"#{int(r):02x}{int(g):02x}{int(b):02x}", (x, y))
-    return img
+            if hits:
+                i = (y * w + x) * 4
+                pixels[i:i + 4] = bytes((r // hits, g // hits, b // hits, 255 * hits // n))
+    return photo(master, w, h, pixels)
 
 
 def circle(cx, cy, r):
@@ -599,25 +799,35 @@ def segment(ax, ay, bx, by, t):
     return inside
 
 
-def make_logo(master, s: int, bg: str | None, ss: int = 3) -> tk.PhotoImage:
-    layers = [(C.ACCENT, rrect(0, 0, s, s, s * 0.26))]
+def make_logo(master, s: int, ss: int = 3) -> tk.PhotoImage:
+    """Fallback for when the bundled icon can't be read: an ivory tile with green rows."""
+    layers = [(C.ON_ACCENT, rrect(0, 0, s, s, s * 0.26))]
     for i in range(3):
         y = s * (0.3 + i * 0.2)
-        layers.append((C.WHITE, circle(s * 0.3, y, s * 0.065)))
-        layers.append((C.WHITE, rrect(s * 0.42, y - s * 0.045, s * 0.74, y + s * 0.045, s * 0.045)))
-    return raster(master, s, s, layers, bg=bg, ss=ss)
+        layers.append((C.ACCENT, circle(s * 0.3, y, s * 0.065)))
+        layers.append((C.ACCENT, rrect(s * 0.42, y - s * 0.045, s * 0.74, y + s * 0.045, s * 0.045)))
+    return raster(master, s, s, layers, ss=ss)
 
 
-def make_checkbox(master, size: int, width: int, checked: bool, bg: str) -> tk.PhotoImage:
+def make_program_icon(master, s: int) -> tk.PhotoImage:
+    """Generic icon for services whose own icon can't be read: a green tile with a prompt."""
+    t = s * 0.1
+    return raster(master, s, s, [(C.ACCENT, rrect(s * 0.06, s * 0.06, s * 0.94, s * 0.94, s * 0.22)),
+                                 (C.ON_ACCENT, segment(s * 0.3, s * 0.34, s * 0.48, s * 0.5, t)),
+                                 (C.ON_ACCENT, segment(s * 0.48, s * 0.5, s * 0.3, s * 0.66, t)),
+                                 (C.ON_ACCENT, segment(s * 0.56, s * 0.68, s * 0.72, s * 0.68, t))], ss=3)
+
+
+def make_checkbox(master, size: int, width: int, checked: bool) -> tk.PhotoImage:
     s = size
     if checked:
         layers = [(C.ACCENT, rrect(0.5, 0.5, s - 0.5, s - 0.5, s * 0.22)),
-                  (C.WHITE, segment(s * 0.26, s * 0.52, s * 0.43, s * 0.69, s * 0.13)),
-                  (C.WHITE, segment(s * 0.43, s * 0.69, s * 0.75, s * 0.32, s * 0.13))]
+                  (C.ON_ACCENT, segment(s * 0.26, s * 0.52, s * 0.43, s * 0.69, s * 0.13)),
+                  (C.ON_ACCENT, segment(s * 0.43, s * 0.69, s * 0.75, s * 0.32, s * 0.13))]
     else:
         layers = [(C.BORDER_STRONG, rrect(0.5, 0.5, s - 0.5, s - 0.5, s * 0.22)),
                   (C.INPUT, rrect(1.6, 1.6, s - 1.6, s - 1.6, s * 0.16))]
-    return raster(master, width, s, layers, bg=bg)
+    return raster(master, width, s, layers)
 
 
 # ---------- Small widgets ----------
@@ -645,8 +855,8 @@ class Tooltip:
         tw = self.tip = tk.Toplevel(self.widget)
         tw.wm_overrideredirect(True)
         tw.attributes("-topmost", True)
-        tw.configure(bg=C.BORDER_STRONG)
-        tk.Label(tw, text=self.text, bg="#26282f", fg=C.TEXT, font="TkTooltipFont",
+        tw.configure(bg=C.NAV_SELECTED)
+        tk.Label(tw, text=self.text, bg=C.SIDEBAR, fg=C.SIDE_TEXT, font="TkTooltipFont",
                  padx=8, pady=4).pack(padx=1, pady=1)
         x = self.widget.winfo_rootx()
         y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
@@ -663,7 +873,7 @@ class NavRow(tk.Frame):
     """A clickable sidebar entry with icon, label and badge."""
 
     def __init__(self, parent, app: App, icon: str, text: str, on_click, on_menu=None, on_double=None,
-                 icon_fg: str = C.MUTED):
+                 icon_fg: str = C.SIDE_MUTED):
         super().__init__(parent, bg=C.SIDEBAR, cursor="hand2")
         self.app = app
         self._selected = self._hover = False
@@ -673,11 +883,11 @@ class NavRow(tk.Frame):
         self.bar.pack(side="left", fill="y")
         self.icon = tk.Label(self, text=icon, fg=icon_fg, font=app.f_icon, width=2, bg=C.SIDEBAR)
         self.icon.pack(side="left", padx=(px(6), px(4)), pady=px(5))
-        self.badge = tk.Label(self, fg=C.DIM, font=app.f_small, bg=C.SIDEBAR)
+        self.badge = tk.Label(self, fg=C.SIDE_DIM, font=app.f_small, bg=C.SIDEBAR)
         self.badge.pack(side="right", padx=(px(4), px(10)))
-        self.extra = tk.Label(self, fg=C.AMBER, font=app.f_small, bg=C.SIDEBAR)
+        self.extra = tk.Label(self, fg=C.SIDE_AMBER, font=app.f_small, bg=C.SIDEBAR)
         self.extra.pack(side="right")
-        self.label = tk.Label(self, fg=C.TEXT, font=app.f_base, anchor="w", bg=C.SIDEBAR)
+        self.label = tk.Label(self, fg=C.SIDE_TEXT, font=app.f_base, anchor="w", bg=C.SIDEBAR)
         self.label.pack(side="left", fill="x", expand=True)
         for w in (self, self.bar, self.icon, self.label, self.badge, self.extra):
             w.bind("<Enter>", lambda e: self._set_hover(True))
@@ -698,9 +908,9 @@ class NavRow(tk.Frame):
         bg = C.NAV_SELECTED if self._selected else C.NAV_HOVER if self._hover else C.SIDEBAR
         for w in (self, self.icon, self.label, self.badge, self.extra):
             w.configure(bg=bg)
-        self.bar.configure(bg=C.ACCENT if self._selected else bg)
+        self.bar.configure(bg=C.SIDE_ACCENT if self._selected else bg)
         self.label.configure(font=self.app.f_bold if self._selected else self.app.f_base,
-                             fg=C.TEXT if self._selected else "#c4c8d0")
+                             fg=C.SIDE_TEXT if self._selected else C.SIDE_MUTED)
 
     def set_state(self, selected=None, text=None, badge=None, badge_fg=None, extra=None):
         if selected is not None and selected != self._selected:
@@ -748,25 +958,25 @@ class SearchEntry(tk.Frame):
 
 # ---------- Dialogs ----------
 class Dialog(tk.Toplevel):
-    def __init__(self, app: App, title: str):
-        super().__init__(app)
+    def __init__(self, app: App, title: str, parent: tk.Misc | None = None):
+        super().__init__(parent or app)
         self.withdraw()
         self.app = app
         self.result = None
         self.initial_focus: tk.Widget | None = None
         self.title(title)
         self.configure(bg=C.BG)
-        self.transient(app)
+        self.transient(parent or app)
         self.resizable(False, False)
         px = app.px
         self.body = tk.Frame(self, bg=C.BG)
         self.body.pack(fill="both", expand=True, padx=px(26), pady=(px(22), px(18)))
         tk.Frame(self, bg=C.BORDER, height=1).pack(fill="x")
-        footer = tk.Frame(self, bg=C.SIDEBAR)
+        footer = tk.Frame(self, bg=C.FOOTER)
         footer.pack(fill="x")
-        self.footer = tk.Frame(footer, bg=C.SIDEBAR)
+        self.footer = tk.Frame(footer, bg=C.FOOTER)
         self.footer.pack(fill="x", padx=px(26), pady=px(14))
-        self.error = tk.Label(self.footer, text="", fg=C.RED, bg=C.SIDEBAR, font=app.f_small, anchor="w")
+        self.error = tk.Label(self.footer, text="", fg=C.RED, bg=C.FOOTER, font=app.f_small, anchor="w")
         self.error.pack(side="left", fill="x", expand=True)
         self.bind("<Escape>", lambda e: self.cancel())
         self.protocol("WM_DELETE_WINDOW", self.cancel)
@@ -801,18 +1011,24 @@ class Dialog(tk.Toplevel):
 
     def show(self):
         self.update_idletasks()
-        apply_dark_titlebar(self, C.BG)
+        apply_titlebar(self)
         w, h = self.winfo_reqwidth(), self.winfo_reqheight()
+        owner = self.master
         if self.app.state() == "iconic":
             x, y = (self.winfo_screenwidth() - w) // 2, (self.winfo_screenheight() - h) // 3
         else:
-            x = self.app.winfo_rootx() + (self.app.winfo_width() - w) // 2
-            y = self.app.winfo_rooty() + max(0, (self.app.winfo_height() - h) // 3)
+            x = owner.winfo_rootx() + (owner.winfo_width() - w) // 2
+            y = owner.winfo_rooty() + max(0, (owner.winfo_height() - h) // 3)
         self.geometry(f"+{max(0, x)}+{max(0, y)}")
         self.deiconify()
+        try: previous = self.grab_current()   # the dialog this one was opened from
+        except KeyError: previous = None
         self.grab_set()
         (self.initial_focus or self).focus_set()
         self.wait_window()
+        if previous and previous.winfo_exists():
+            previous.grab_set()
+            previous.focus_set()
         return self.result
 
     def fail(self, message: str):
@@ -880,10 +1096,12 @@ class GroupDialog(Dialog):
         ttk.Checkbutton(self.body, text="Start this group automatically when Workaholic opens",
                         variable=self.autostart_var).pack(anchor="w")
         trigger_row = self.field("Start when this process runs",
-                                 "Optional: enter a name such as ffxiv_dx11.exe, or browse for an executable. "
-                                 "Workaholic must stay open. Closing the process leaves the group running.")
+                                 "Optional: pick a game or app that's running now, type a name such as "
+                                 "ffxiv_dx11.exe, or browse for an executable. Workaholic must stay open. "
+                                 "Closing the process leaves the group running.")
         self.trigger_var = tk.StringVar(self, value=group.trigger_process if group else "")
         ttk.Entry(trigger_row, textvariable=self.trigger_var).pack(side="left", fill="x", expand=True)
+        ttk.Button(trigger_row, text="Pick running app…", command=self._pick_trigger).pack(side="left", padx=(px(8), 0))
         ttk.Button(trigger_row, text="Browse…", command=self._browse_trigger).pack(side="left", padx=(px(8), 0))
         delay_row = tk.Frame(self.body, bg=C.BG)
         delay_row.pack(fill="x", pady=(px(10), 0))
@@ -896,6 +1114,10 @@ class GroupDialog(Dialog):
 
         self.add_buttons("Save" if group else "Create group")
         self._render()
+
+    def _pick_trigger(self):
+        target = ProcessPickerDialog(self.app, self).show()
+        if target: self.trigger_var.set(target)
 
     def _browse_trigger(self):
         path = filedialog.askopenfilename(parent=self, title="Choose the process that starts this group",
@@ -1046,6 +1268,18 @@ class ServiceDialog(Dialog):
         ce = ttk.Entry(self.field("Working folder", "Leave empty to use the program's folder."),
                        textvariable=self.cwd_var)
         ce.pack(fill="x")
+
+        self.icon = service.icon
+        row = self.field("Icon")
+        self.icon_preview = tk.Label(row, bg=C.BG)
+        self.icon_preview.pack(side="left")
+        self.icon_label = tk.Label(row, fg=C.MUTED, bg=C.BG, font=app.f_small, anchor="w")
+        self.icon_label.pack(side="left", fill="x", expand=True, padx=(px(10), 0))
+        self.icon_auto = ttk.Button(row, text="Use automatic", command=lambda: self._set_icon(""))
+        self.icon_auto.pack(side="right")
+        ttk.Button(row, text="Choose…", command=self._choose_icon).pack(side="right", padx=(0, px(8)))
+        for var in (self.path_var, self.interp_var): var.trace_add("write", lambda *_: self._set_icon(self.icon))
+        self._set_icon(self.icon)
         if locked:
             for w in (pe, pb, ie, ib, ce): w.state(["disabled"])
 
@@ -1054,6 +1288,25 @@ class ServiceDialog(Dialog):
         ttk.Checkbutton(self.body, text="Restart automatically if it crashes",
                         variable=self.restart_var).pack(anchor="w")
         self.add_buttons()
+
+    def _set_icon(self, spec: str):
+        self.icon = spec
+        path, interp = self.path_var.get().strip(), self.interp_var.get().strip()
+        self.icon_preview.configure(image=self.app.icon_image(icon_sources(path, interp, spec), self.app.px(32)))
+        if spec:
+            file, index = parse_icon_spec(spec)
+            text = f"{Path(file).name}, icon {index + 1}"
+        elif Path(path).suffix.lower() in (".py", ".pyw"): text = "Automatic — Python's icon"
+        else: text = "Automatic — the program's own icon"
+        self.icon_label.configure(text=text)
+        self.icon_auto.state(["!disabled"] if spec else ["disabled"])
+
+    def _choose_icon(self):
+        program = self.path_var.get().strip()
+        if Path(program).suffix.lower() in (".py", ".pyw"):
+            program = next(iter(icon_sources(program, self.interp_var.get().strip())), "")
+        spec = IconPickerDialog(self.app, self, self.icon, program).show()
+        if spec is not None: self._set_icon(spec)
 
     def _browse_path(self):
         p = filedialog.askopenfilename(parent=self, title="Choose file", initialfile=self.path_var.get(),
@@ -1077,7 +1330,207 @@ class ServiceDialog(Dialog):
         cwd = self.cwd_var.get().strip()
         if cwd and not Path(cwd).is_dir(): return self.fail("The working folder doesn't exist.")
         return {"name": self.name_var.get().strip(), "path": path, "args": self.args_var.get().strip(),
-                "interpreter": interp, "auto_restart": self.restart_var.get(), "working_dir": cwd}
+                "interpreter": interp, "auto_restart": self.restart_var.get(), "working_dir": cwd,
+                "icon": self.icon}
+
+
+class IconPickerDialog(Dialog):
+    COLUMNS, ROWS = 9, 5
+
+    def __init__(self, app: App, parent: tk.Misc, current: str, program: str):
+        super().__init__(app, "Choose icon", parent)
+        px = app.px
+        self.heading("Choose an icon", "Pick an icon for this service, or browse for an .ico, .exe or .dll file.")
+        self.size, self.cell = px(32), px(52)
+        self.images: list[tk.PhotoImage] = []
+        self.cells: list[int] = []       # icon index shown in each grid cell
+        self.file = ""
+        self.selected: int | None = None
+
+        tabs = tk.Frame(self.body, bg=C.BG)
+        tabs.pack(fill="x", pady=(px(16), px(10)))
+        sources = ([("This program", program)] if icon_count(program) else []) + list(WINDOWS_ICON_LIBRARIES)
+        self.tabs: dict[str, ttk.Button] = {}
+        for label, file in sources:
+            b = ttk.Button(tabs, text=label, style="Tab.TButton", command=lambda f=file: self._load(f))
+            b.pack(side="left", padx=(0, px(6)))
+            self.tabs[file] = b
+        ttk.Button(tabs, text="Browse…", style="Small.TButton", command=self._browse).pack(side="right")
+
+        box = tk.Frame(self.body, bg=C.INPUT, highlightthickness=1, highlightbackground=C.BORDER_STRONG)
+        box.pack(fill="both", expand=True)
+        self.canvas = tk.Canvas(box, bg=C.INPUT, highlightthickness=0, bd=0, width=self.COLUMNS * self.cell,
+                                height=self.ROWS * self.cell, yscrollincrement=self.cell)
+        sb = ttk.Scrollbar(box, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.hover = self.canvas.create_rectangle(0, 0, 0, 0, fill=C.BUTTON, outline="", state="hidden")
+        self.mark = self.canvas.create_rectangle(0, 0, 0, 0, fill=C.SELECT, outline=C.ACCENT, width=2,
+                                                 state="hidden")
+        self.canvas.bind("<Button-1>", self._on_click)
+        self.canvas.bind("<Double-1>", lambda e: self.ok())
+        self.canvas.bind("<Motion>", self._on_motion)
+        self.canvas.bind("<Leave>", lambda e: self.canvas.itemconfigure(self.hover, state="hidden"))
+        self.canvas.bind("<MouseWheel>", lambda e: self.canvas.yview_scroll(-1 if e.delta > 0 else 1, "units"))
+
+        self.add_buttons("Use icon")
+        if current:
+            file, index = parse_icon_spec(current)
+            raw = current.rpartition(",")[0] or current
+            self._load(raw if Path(file).is_file() or not sources else sources[0][1], select=index)
+        elif sources:
+            self._load(sources[0][1])
+
+    def _load(self, file: str, select: int | None = None):
+        self.configure(cursor="watch")
+        self.update_idletasks()
+        try:
+            path = os.path.expandvars(file)
+            pixels = load_icons(path, self.size, 0, icon_count(path))
+        except Exception:
+            pixels = []
+        finally:
+            self.configure(cursor="")
+        self.file, self.selected = file, None
+        self.canvas.delete("icon")
+        self.images, self.cells = [], []
+        for index, data in enumerate(pixels):
+            if not data or not any(data[3::4]): continue    # skip empty slots
+            row, col = divmod(len(self.cells), self.COLUMNS)
+            img = photo(self, self.size, self.size, data)
+            self.canvas.create_image((col + 0.5) * self.cell, (row + 0.5) * self.cell, image=img, tags="icon")
+            self.images.append(img)
+            self.cells.append(index)
+        rows = max(self.ROWS, -(-len(self.cells) // self.COLUMNS))
+        self.canvas.configure(scrollregion=(0, 0, self.COLUMNS * self.cell, rows * self.cell))
+        self.canvas.yview_moveto(0)
+        self.canvas.itemconfigure(self.mark, state="hidden")
+        for f, b in self.tabs.items(): b.configure(style="TabOn.TButton" if f == file else "Tab.TButton")
+        if not self.cells:
+            return self.fail("That file has no icons.")
+        self.fail("")
+        self.error.configure(text=f"{len(self.cells)} icons", fg=C.MUTED)
+        if select in self.cells: self._select(self.cells.index(select), scroll=True)
+
+    def _cell_at(self, e) -> int | None:
+        col, row = int(self.canvas.canvasx(e.x) // self.cell), int(self.canvas.canvasy(e.y) // self.cell)
+        pos = row * self.COLUMNS + col
+        return pos if 0 <= col < self.COLUMNS and 0 <= pos < len(self.cells) else None
+
+    def _box(self, pos: int):
+        row, col = divmod(pos, self.COLUMNS)
+        pad = self.app.px(3)
+        return (col * self.cell + pad, row * self.cell + pad, (col + 1) * self.cell - pad, (row + 1) * self.cell - pad)
+
+    def _on_motion(self, e):
+        pos = self._cell_at(e)
+        if pos is None: return self.canvas.itemconfigure(self.hover, state="hidden")
+        self.canvas.coords(self.hover, *self._box(pos))
+        self.canvas.itemconfigure(self.hover, state="normal")
+        self.canvas.tag_lower(self.hover)
+
+    def _on_click(self, e):
+        pos = self._cell_at(e)
+        if pos is not None: self._select(pos)
+
+    def _select(self, pos: int, scroll: bool = False):
+        self.selected = self.cells[pos]
+        self.canvas.coords(self.mark, *self._box(pos))
+        self.canvas.itemconfigure(self.mark, state="normal")
+        self.canvas.tag_raise(self.mark, self.hover)
+        self.canvas.tag_raise("icon")
+        if scroll:
+            self.canvas.yview_moveto(max(0, pos // self.COLUMNS - 1) * self.cell
+                                     / float(self.canvas.cget("scrollregion").split()[3]))
+
+    def _browse(self):
+        path = filedialog.askopenfilename(parent=self, title="Choose an icon file",
+                                          filetypes=[("Icons and programs", "*.ico *.exe *.dll"), ("All files", "*.*")])
+        if path: self._load(os.path.normpath(path))
+
+    def validate(self):
+        if self.selected is None: return self.fail("Click an icon to choose it.")
+        return f"{self.file},{self.selected}"
+
+
+class ProcessPickerDialog(Dialog):
+    """Choose a running program by its window, like OBS's game capture list."""
+
+    def __init__(self, app: App, parent: tk.Misc):
+        super().__init__(app, "Pick a running app", parent)
+        px = app.px
+        self.heading("Pick a running app",
+                     "Start the game or program first, then choose it here. Workaholic remembers its "
+                     "executable and starts the group whenever it runs again.")
+        self.choices: list[dict] = []
+        self.incoming = queue.Queue()
+        self.query = tk.StringVar(self)
+        entry = ttk.Entry(self.body, textvariable=self.query, width=64)
+        entry.pack(fill="x", pady=(px(16), px(10)))
+        self.initial_focus = entry
+        self.query.trace_add("write", lambda *_: self._filter())
+        box = tk.Frame(self.body, bg=C.PANEL, highlightthickness=1, highlightbackground=C.BORDER_STRONG)
+        box.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(box, columns=("program",), selectmode="browse", height=10)
+        self.tree.heading("#0", text="WINDOW", anchor="w")
+        self.tree.heading("program", text="PROGRAM", anchor="w")
+        self.tree.column("#0", width=px(330))
+        self.tree.column("program", width=px(190))
+        sb = ttk.Scrollbar(box, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.tree.pack(fill="both", expand=True, padx=(px(4), 0), pady=px(2))
+        self.tree.bind("<Double-1>", lambda e: self.ok())
+
+        self.background_var = tk.BooleanVar(self, value=False)
+        ttk.Checkbutton(self.body, text="Include background programs without a window", variable=self.background_var,
+                        command=self._reload).pack(anchor="w", pady=(px(10), 0))
+        self.exact_var = tk.BooleanVar(self, value=False)
+        ttk.Checkbutton(self.body, text="Only match this exact file location, not just the program name",
+                        variable=self.exact_var).pack(anchor="w", pady=(px(4), 0))
+        self.add_buttons("Use this app")
+        ttk.Button(self.footer, text="Refresh", command=self._reload).pack(side="right", padx=(0, px(8)))
+        self._reload()
+
+    def _reload(self):
+        self.error.configure(text="Looking for running apps…", fg=C.MUTED)
+        background = self.background_var.get()
+        threading.Thread(target=self._load, args=(background,), daemon=True).start()
+        self.after(100, self._receive)
+
+    def _load(self, background: bool):
+        try: self.incoming.put(program_choices(visible_windows(), process_snapshot(), background))
+        except Exception as e: self.incoming.put(e)
+
+    def _receive(self):
+        if not self.winfo_exists(): return
+        try: result = self.incoming.get_nowait()
+        except queue.Empty:
+            self.after(100, self._receive)
+            return
+        if isinstance(result, Exception):
+            self.error.configure(text="Couldn't list running apps. Use Browse instead.", fg=C.RED)
+            return
+        self.choices = result
+        self._filter()
+
+    def _filter(self):
+        self.tree.delete(*self.tree.get_children())
+        words = self.query.get().strip().casefold().split()
+        size = self.app.px(20)
+        for i, c in enumerate(self.choices):
+            if all(w in f"{c['title']} {c['name']}".casefold() for w in words):
+                self.tree.insert("", "end", iid=str(i), text=c["title"] or "(no window)", values=(c["name"],),
+                                 image=self.app.spaced(self.app.icon_image([c["exe"]] if c["exe"] else [], size)))
+        count = len(self.tree.get_children())
+        self.error.configure(text=f"{count} apps" if count else "Nothing found. Is it running?", fg=C.MUTED)
+
+    def validate(self):
+        selected = self.tree.selection()
+        if not selected: return self.fail("Select the app that should start this group.")
+        c = self.choices[int(selected[0])]
+        return c["exe"] if self.exact_var.get() and c["exe"] else c["name"]
 
 
 class SettingsDialog(Dialog):
@@ -1168,6 +1621,10 @@ class App(tk.Tk):
         self._process_scan_pending = False
         self._trigger_states: dict[int, tuple[str, bool]] = {}
         self._group_restart_tokens: dict[int, object] = {}
+        self._icons: dict[tuple[str, int], tk.PhotoImage | None] = {}
+        self._fallback_icons: dict[int, tk.PhotoImage] = {}
+        self._service_icons: dict[tuple[str, str, str], tk.PhotoImage] = {}
+        self._row_images: dict[tuple[str, str], tk.PhotoImage] = {}
 
         self._load_config()
         self._init_fonts()
@@ -1186,7 +1643,7 @@ class App(tk.Tk):
         self._refresh()
         self._log_show(None)
         self.update_idletasks()
-        apply_dark_titlebar(self, C.BG)
+        apply_titlebar(self)
         if opts.minimized or (opts.startup and self.settings.start_minimized):
             self.iconify()
         else:
@@ -1241,18 +1698,60 @@ class App(tk.Tk):
     def _init_images(self):
         px = self.px
         h = px(12)
-        self.dot_images = {key: raster(self, px(20), h, [(color, circle(px(7), h / 2, px(4.2)))], bg=C.PANEL)
+        self.dot_images = {key: raster(self, px(16), h, [(color, circle(px(6), h / 2, px(4.2)))])
                            for key, color in STATUS_COLORS.items()}
         box = px(16)
-        self.img_cb_off = make_checkbox(self, box, box + px(8), False, C.BG)
-        self.img_cb_on = make_checkbox(self, box, box + px(8), True, C.BG)
-        self.img_list_off = make_checkbox(self, box, box + px(10), False, C.INPUT)
-        self.img_list_on = make_checkbox(self, box, box + px(10), True, C.INPUT)
-        self.logo = make_logo(self, px(26), C.SIDEBAR)
-        self.iconphoto(True, *(make_logo(self, n, None) for n in (32, 16)))
+        self.img_cb_off = make_checkbox(self, box, box + px(8), False)
+        self.img_cb_on = make_checkbox(self, box, box + px(8), True)
+        self.img_list_off = make_checkbox(self, box, box + px(10), False)
+        self.img_list_on = make_checkbox(self, box, box + px(10), True)
         icon = Path(getattr(sys, "_MEIPASS", APP_DIR)) / "assets" / "workaholic.ico"
+        self.logo = self.icon_image([str(icon)], px(30), fallback=False) or make_logo(self, px(30))
         if IS_WINDOWS and icon.is_file():
             self.iconbitmap(default=str(icon))
+        else:
+            self.iconphoto(True, *(make_logo(self, n) for n in (32, 16)))
+
+    def icon_image(self, sources: list[str], size: int, fallback: bool = True) -> tk.PhotoImage | None:
+        """The first icon that loads from `sources` ("file" or "file,index"), cached."""
+        for spec in sources:
+            key = (spec, size)
+            if key not in self._icons:
+                try:
+                    path, index = parse_icon_spec(spec)
+                    pixels = load_icons(path, size, index)
+                    self._icons[key] = photo(self, size, size, pixels[0]) if pixels and pixels[0] else None
+                except Exception:
+                    self._icons[key] = None
+            if self._icons[key]: return self._icons[key]
+        if not fallback: return None
+        if size not in self._fallback_icons: self._fallback_icons[size] = make_program_icon(self, size)
+        return self._fallback_icons[size]
+
+    def spaced(self, icon: tk.PhotoImage) -> tk.PhotoImage:
+        """The icon with a gap after it, so list text doesn't touch it."""
+        img = self._row_images.get((str(icon), ""))
+        if img is None:
+            img = self._row_images[(str(icon), "")] = tk.PhotoImage(master=self, width=icon.width() + self.px(8),
+                                                                    height=icon.height())
+            img.tk.call(img, "copy", icon, "-to", 0, 0)
+        return img
+
+    def _row_image(self, s: Service, status: str) -> tk.PhotoImage:
+        """Status dot and service icon side by side, for the Name column."""
+        key = (s.path, s.interpreter, s.icon)
+        icon = self._service_icons.get(key)
+        if icon is None:
+            icon = self._service_icons[key] = self.icon_image(icon_sources(*key), self.px(20))
+        row_key = (str(icon), status)
+        img = self._row_images.get(row_key)
+        if img is None:
+            dot = self.dot_images[status]
+            w, h = dot.width() + icon.width() + self.px(8), max(dot.height(), icon.height())
+            img = self._row_images[row_key] = tk.PhotoImage(master=self, width=w, height=h)
+            img.tk.call(img, "copy", dot, "-to", 0, (h - dot.height()) // 2)
+            img.tk.call(img, "copy", icon, "-to", dot.width(), (h - icon.height()) // 2)
+        return img
 
     def _init_style(self):
         px = self.px
@@ -1274,10 +1773,14 @@ class App(tk.Tk):
                                                                  else C.BORDER_STRONG)])
 
         button("TButton", C.BUTTON, C.BUTTON_HOVER, C.BUTTON_PRESS, C.TEXT, C.BORDER)
-        button("Accent.TButton", C.ACCENT, C.ACCENT_HOVER, C.ACCENT_PRESS, C.WHITE, C.ACCENT)
+        button("Accent.TButton", C.ACCENT, C.ACCENT_HOVER, C.ACCENT_PRESS, C.ON_ACCENT, C.ACCENT)
         button("Small.TButton", C.BUTTON, C.BUTTON_HOVER, C.BUTTON_PRESS, C.TEXT, C.BORDER,
                pad=(px(10), px(3)), font=self.f_small)
         button("Icon.TButton", C.BUTTON, C.BUTTON_HOVER, C.BUTTON_PRESS, C.TEXT, C.BORDER, pad=(px(8), px(4)))
+        button("Tab.TButton", C.BG, C.BUTTON_HOVER, C.BUTTON_PRESS, C.MUTED, C.BORDER, pad=(px(12), px(4)),
+               font=self.f_small)
+        button("TabOn.TButton", C.SELECT, C.SELECT, C.SELECT, C.ACCENT, C.ACCENT, pad=(px(12), px(4)),
+               font=self.f_small_bold)
 
         s.configure("TEntry", fieldbackground=C.INPUT, foreground=C.TEXT, bordercolor=C.BORDER_STRONG,
                     lightcolor=C.INPUT, darkcolor=C.INPUT, insertcolor=C.TEXT, padding=(px(8), px(5)))
@@ -1320,21 +1823,26 @@ class App(tk.Tk):
                     lightcolor=C.BUTTON, darkcolor=C.BUTTON, gripcount=0, arrowsize=px(10))
         s.map("Vertical.TScrollbar", background=[("active", C.BORDER_STRONG)],
               lightcolor=[("active", C.BORDER_STRONG)], darkcolor=[("active", C.BORDER_STRONG)])
+        s.layout("Log.Vertical.TScrollbar", s.layout("Vertical.TScrollbar"))
+        s.configure("Log.Vertical.TScrollbar", background=C.LOG_THUMB, troughcolor=C.LOG_BG, bordercolor=C.LOG_BG,
+                    lightcolor=C.LOG_THUMB, darkcolor=C.LOG_THUMB)
+        s.map("Log.Vertical.TScrollbar", background=[("active", C.LOG_SELECT)],
+              lightcolor=[("active", C.LOG_SELECT)], darkcolor=[("active", C.LOG_SELECT)])
 
     def menu(self, parent=None) -> tk.Menu:
-        return tk.Menu(parent or self, tearoff=0, bg="#22242a", fg=C.TEXT, activebackground=C.SELECT,
-                       activeforeground=C.TEXT, disabledforeground=C.DIM, selectcolor=C.TEXT, bd=0,
+        return tk.Menu(parent or self, tearoff=0, bg=C.PANEL, fg=C.TEXT, activebackground=C.SELECT,
+                       activeforeground=C.TEXT, disabledforeground=C.DIM, selectcolor=C.ACCENT, bd=0,
                        relief="flat", font=self.f_base)
 
     # ---------- Layout ----------
     def _build(self):
         px = self.px
-        bar = tk.Frame(self, bg=C.SIDEBAR)
+        bar = tk.Frame(self, bg=C.FOOTER)
         bar.pack(side="bottom", fill="x")
         tk.Frame(bar, bg=C.BORDER, height=1).pack(side="top", fill="x")
-        self.status_msg = tk.Label(bar, text="Ready", bg=C.SIDEBAR, fg=C.DIM, font=self.f_small, anchor="w")
+        self.status_msg = tk.Label(bar, text="Ready", bg=C.FOOTER, fg=C.DIM, font=self.f_small, anchor="w")
         self.status_msg.pack(side="left", fill="x", expand=True, padx=px(14), pady=px(5))
-        self.status_summary = tk.Label(bar, bg=C.SIDEBAR, fg=C.DIM, font=self.f_small)
+        self.status_summary = tk.Label(bar, bg=C.FOOTER, fg=C.DIM, font=self.f_small)
         self.status_summary.pack(side="right", padx=px(14))
 
         body = tk.Frame(self, bg=C.BG)
@@ -1342,7 +1850,6 @@ class App(tk.Tk):
         self.sidebar = tk.Frame(body, bg=C.SIDEBAR, width=px(236))
         self.sidebar.pack(side="left", fill="y")
         self.sidebar.pack_propagate(False)
-        tk.Frame(body, bg=C.BORDER, width=1).pack(side="left", fill="y")
         main = tk.Frame(body, bg=C.BG)
         main.pack(side="left", fill="both", expand=True)
         self._build_sidebar()
@@ -1352,15 +1859,15 @@ class App(tk.Tk):
         px = self.px
         row = tk.Frame(self.sidebar, bg=C.SIDEBAR)
         row.pack(fill="x", padx=(px(22), px(12)), pady=(px(16), px(4)))
-        tk.Label(row, text=text, font=self.f_section, fg=C.DIM, bg=C.SIDEBAR).pack(side="left")
+        tk.Label(row, text=text, font=self.f_section, fg=C.SIDE_DIM, bg=C.SIDEBAR).pack(side="left")
         if action:
             glyph, command, tip = action
-            btn = tk.Label(row, text=glyph, font=self.f_heading, fg=C.MUTED, bg=C.SIDEBAR, cursor="hand2",
+            btn = tk.Label(row, text=glyph, font=self.f_heading, fg=C.SIDE_MUTED, bg=C.SIDEBAR, cursor="hand2",
                            padx=px(6))
             btn.pack(side="right")
             btn.bind("<Button-1>", lambda e: command())
-            btn.bind("<Enter>", lambda e: btn.configure(fg=C.TEXT, bg=C.NAV_SELECTED), add="+")
-            btn.bind("<Leave>", lambda e: btn.configure(fg=C.MUTED, bg=C.SIDEBAR), add="+")
+            btn.bind("<Enter>", lambda e: btn.configure(fg=C.SIDE_TEXT, bg=C.NAV_SELECTED), add="+")
+            btn.bind("<Leave>", lambda e: btn.configure(fg=C.SIDE_MUTED, bg=C.SIDEBAR), add="+")
             Tooltip(btn, tip)
 
     def _build_sidebar(self):
@@ -1368,7 +1875,7 @@ class App(tk.Tk):
         brand = tk.Frame(sb, bg=C.SIDEBAR)
         brand.pack(fill="x", padx=px(20), pady=(px(22), px(6)))
         tk.Label(brand, image=self.logo, bg=C.SIDEBAR).pack(side="left")
-        tk.Label(brand, text=APP_NAME, font=self.f_brand, fg=C.TEXT, bg=C.SIDEBAR).pack(side="left", padx=(px(10), 0))
+        tk.Label(brand, text=APP_NAME, font=self.f_brand, fg=C.SIDE_TEXT, bg=C.SIDEBAR).pack(side="left", padx=(px(10), 0))
 
         footer = tk.Frame(sb, bg=C.SIDEBAR)
         footer.pack(side="bottom", fill="x", pady=px(10))
@@ -1377,7 +1884,7 @@ class App(tk.Tk):
         self._sidebar_section("LIBRARY")
         self.nav_all = NavRow(sb, self, "≡", "All services", on_click=lambda: self.set_view("all"))
         self.nav_all.pack(fill="x", padx=px(8), pady=1)
-        self.nav_running = NavRow(sb, self, "●", "Running", icon_fg=C.GREEN,
+        self.nav_running = NavRow(sb, self, "●", "Running", icon_fg=C.SIDE_GREEN,
                                   on_click=lambda: self.set_view("running"))
         self.nav_running.pack(fill="x", padx=px(8), pady=1)
 
@@ -1490,18 +1997,19 @@ class App(tk.Tk):
 
         body = tk.Frame(card, bg=C.LOG_BG)
         body.pack(fill="both", expand=True)
-        sb = ttk.Scrollbar(body, orient="vertical")
+        sb = ttk.Scrollbar(body, orient="vertical", style="Log.Vertical.TScrollbar")
         sb.pack(side="right", fill="y")
         self.log_text = tk.Text(body, bg=C.LOG_BG, fg=C.LOG_TEXT, font=self.f_mono, bd=0, highlightthickness=0,
                                 wrap="word", padx=px(14), pady=px(10), state="disabled", cursor="xterm",
-                                selectbackground=C.SELECT, selectforeground=C.TEXT, insertbackground=C.TEXT,
+                                selectbackground=C.LOG_SELECT, selectforeground=C.LOG_TEXT,
+                                insertbackground=C.LOG_TEXT,
                                 yscrollcommand=sb.set, spacing1=1)
         self.log_text.pack(side="left", fill="both", expand=True)
         sb.configure(command=self.log_text.yview)
-        self.log_text.tag_configure("marker", foreground=C.ACCENT)
-        self.log_text.tag_configure("err", foreground="#ff7b72")
-        self.log_text.tag_configure("warn", foreground=C.AMBER)
-        self.log_text.tag_configure("hint", foreground=C.DIM, font=self.f_base)
+        self.log_text.tag_configure("marker", foreground=C.LOG_MARKER)
+        self.log_text.tag_configure("err", foreground=C.LOG_ERROR)
+        self.log_text.tag_configure("warn", foreground=C.LOG_WARN)
+        self.log_text.tag_configure("hint", foreground=C.LOG_HINT, font=self.f_base)
 
     def _bind_keys(self):
         self.bind("<Control-n>", lambda e: self.add_service())
@@ -1563,9 +2071,9 @@ class App(tk.Tk):
         self.group_rows = {}
         if not self.groups:
             tk.Label(self.group_list, text="Group services to start them\ntogether, or on launch.",
-                     justify="left", fg=C.DIM, bg=C.SIDEBAR, font=self.f_small).pack(
+                     justify="left", fg=C.SIDE_DIM, bg=C.SIDEBAR, font=self.f_small).pack(
                 anchor="w", padx=px(22), pady=(px(2), px(6)))
-            link = tk.Label(self.group_list, text="+ New group", fg=C.ACCENT, bg=C.SIDEBAR, font=self.f_small,
+            link = tk.Label(self.group_list, text="+ New group", fg=C.SIDE_ACCENT, bg=C.SIDEBAR, font=self.f_small,
                             cursor="hand2")
             link.pack(anchor="w", padx=px(22))
             link.bind("<Button-1>", lambda e: self.new_group())
@@ -1583,7 +2091,7 @@ class App(tk.Tk):
         running = sum(s.is_running for s in self.services)
         self.nav_all.set_state(selected=kind == "all", badge=str(len(self.services)))
         self.nav_running.set_state(selected=kind == "running", badge=str(running),
-                                   badge_fg=C.GREEN if running else C.DIM)
+                                   badge_fg=C.SIDE_GREEN if running else C.SIDE_DIM)
         index = self.service_index()
         for g in self.groups:
             row = self.group_rows.get(id(g))
@@ -1591,7 +2099,7 @@ class App(tk.Tk):
             members = self.group_services(g, index)
             r = sum(s.is_running for s in members)
             row.set_state(selected=kind == "group" and cur is g, text=g.name, badge=f"{r}/{len(members)}",
-                          badge_fg=C.GREEN if r else C.DIM, extra="⚡" if g.autostart else "")
+                          badge_fg=C.SIDE_GREEN if r else C.SIDE_DIM, extra="⚡" if g.autostart else "")
 
     def _render_header(self):
         px = self.px
@@ -1664,12 +2172,12 @@ class App(tk.Tk):
                       os.path.normpath(s.path))
             tags = (("odd",) if i % 2 else ()) + (("missing",) if key == "missing" else
                                                   () if key in ("running", "stopping") else ("idle",))
-            row = (s.display_name, key, values, tags)
+            image = self._row_image(s, key)
+            row = (s.display_name, str(image), values, tags)
             if not self.tree.exists(s.id):
-                self.tree.insert("", i, iid=s.id, text=s.display_name, image=self.dot_images[key],
-                                 values=values, tags=tags)
+                self.tree.insert("", i, iid=s.id, text=s.display_name, image=image, values=values, tags=tags)
             elif self._row_cache.get(s.id) != row:
-                self.tree.item(s.id, text=s.display_name, image=self.dot_images[key], values=values, tags=tags)
+                self.tree.item(s.id, text=s.display_name, image=image, values=values, tags=tags)
             self._row_cache[s.id] = row
         if list(self.tree.get_children()) != ids:
             for i, iid in enumerate(ids): self.tree.move(iid, "", i)
@@ -2349,7 +2857,8 @@ class App(tk.Tk):
                                          args=str(entry.get("args") or ""),
                                          interpreter=str(entry.get("interpreter") or ""),
                                          auto_restart=bool(entry.get("auto_restart", False)),
-                                         working_dir=str(entry.get("working_dir") or "")))
+                                         working_dir=str(entry.get("working_dir") or ""),
+                                         icon=str(entry.get("icon") or "")))
 
         raw_groups = data.get("groups", []) or []
         if isinstance(raw_groups, dict):  # v1: {"name": [paths]} + "autostart_groups": [names]
