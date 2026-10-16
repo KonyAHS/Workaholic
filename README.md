@@ -2,7 +2,7 @@
 
 <img src="assets/workaholic.png" alt="Workaholic logo" width="112" height="112">
 
-# Workaholic <sub>مرهق</sub>
+# Workaholic مرهق
 
 **One window for all the scripts and programs you run together.**<br>
 Start them in order, keep an eye on them, and have them launch with your game.
