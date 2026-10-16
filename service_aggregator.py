@@ -28,10 +28,20 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from types import SimpleNamespace
 from tkinter import filedialog, messagebox, ttk
+from version import __version__
 
 APP_NAME = "Workaholic"
 APP_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
-CONFIG_FILE = APP_DIR / "services_config.json"
+def config_path() -> Path:
+    """Keep user settings independent of the executable's location."""
+    if os.name == "nt":
+        base = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
+    else:
+        base = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    return base / APP_NAME / "services_config.json"
+
+
+CONFIG_FILE = config_path()
 IS_WINDOWS = os.name == "nt"
 INSTANCE_PORT = 47613          # localhost port used to keep a single instance running
 STOP_GRACE_SECONDS = 3.0       # time a service gets to exit after a graceful stop signal
@@ -1595,7 +1605,7 @@ class App(tk.Tk):
         super().__init__(className=APP_NAME)
         self.withdraw()
         self.opts = opts
-        self.title(APP_NAME)
+        self.title(f"{APP_NAME} {__version__}")
         self.configure(bg=C.BG)
         self.scale = max(1.0, self.winfo_fpixels("1i") / 96.0)
         self.services: list[Service] = []
@@ -1634,7 +1644,8 @@ class App(tk.Tk):
         self._bind_keys()
         self._restore_window()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
-        self._refresh_login_entry()
+        if not getattr(opts, "smoke_test", False):
+            self._refresh_login_entry()
         if instance_sock:
             threading.Thread(target=self._listen, args=(instance_sock,), daemon=True).start()
 
@@ -2836,13 +2847,22 @@ class App(tk.Tk):
 
     # ---------- Persistence ----------
     def _load_config(self):
-        if not CONFIG_FILE.exists(): return
+        source = CONFIG_FILE
+        legacy = APP_DIR / "services_config.json"
+        if not CONFIG_FILE.exists() and legacy.is_file() and not getattr(self.opts, "smoke_test", False):
+            try:
+                CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(legacy, CONFIG_FILE)
+            except OSError as e:
+                self._config_warning = f"Couldn't migrate settings from {legacy}: {e}"
+                source = legacy  # Still load the user's services if copying fails.
+        if not source.exists(): return
         try:
-            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            data = json.loads(source.read_text(encoding="utf-8"))
             if not isinstance(data, dict): raise ValueError("unexpected format")
         except Exception as e:
-            backup = CONFIG_FILE.with_name(CONFIG_FILE.stem + ".broken.json")
-            try: shutil.copyfile(CONFIG_FILE, backup)
+            backup = source.with_name(source.stem + ".broken.json")
+            try: shutil.copyfile(source, backup)
             except OSError: pass
             self._config_warning = f"Couldn't read {CONFIG_FILE.name} ({e}). A copy was saved as {backup.name}."
             return
@@ -2891,6 +2911,7 @@ class App(tk.Tk):
         }
         tmp = CONFIG_FILE.with_suffix(".json.tmp")
         try:
+            CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
             tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
             os.replace(tmp, CONFIG_FILE)
         except OSError as e:
@@ -2937,11 +2958,34 @@ class App(tk.Tk):
 
 def main():
     parser = argparse.ArgumentParser(description="Run, group and monitor scripts and programs.")
+    parser.add_argument("--version", action="version", version=f"{APP_NAME} {__version__}")
+    parser.add_argument("--smoke-test", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--startup", action="store_true",
                         help="launched at sign-in (honours the 'start minimized' setting)")
     parser.add_argument("--minimized", action="store_true", help="start minimized")
     parser.add_argument("--no-autostart", action="store_true", help="skip launch and process-triggered group startup this time")
     opts = parser.parse_args()
+
+    if opts.smoke_test:
+        # No user settings, sign-in changes, services, or singleton communication.
+        import tempfile
+        global CONFIG_FILE
+        with tempfile.TemporaryDirectory(prefix="workaholic-smoke-") as folder:
+            CONFIG_FILE = Path(folder) / "services_config.json"
+            opts.no_autostart = True
+            enable_dpi_awareness()
+            app = App(opts)
+            try:
+                def callback_error(exc_type, value, traceback):
+                    raise value.with_traceback(traceback)
+                app.report_callback_exception = callback_error
+                app.update()
+                icon = Path(getattr(sys, "_MEIPASS", APP_DIR)) / "assets/workaholic.ico"
+                if not app.logo or not icon.is_file():
+                    raise RuntimeError("App icon did not load")
+            finally:
+                app.destroy()
+        return
 
     instance = acquire_single_instance()
     if instance is False:  # an existing window was brought to the front

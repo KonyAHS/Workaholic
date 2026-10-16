@@ -1,0 +1,76 @@
+name: Windows build and release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          architecture: x64
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - name: Check release tag
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $expected = python -c "from version import __version__; print('v' + __version__)"
+          if ($env:GITHUB_REF_NAME -ne $expected) { throw "Tag must match version.py ($expected)." }
+      - name: Install dependencies
+        run: python -m pip install -r requirements-build.txt
+      - name: Test
+        run: python -m unittest discover -v
+      - name: Build and package
+        shell: pwsh
+        run: ./build.ps1 -Release -SkipInstall
+      - name: Smoke test packaged executable
+        shell: pwsh
+        run: |
+          $app = Start-Process -FilePath ./dist/release/Workaholic.exe -ArgumentList '--smoke-test' -PassThru
+          if (-not $app.WaitForExit(60000)) {
+            $app.Kill()
+            throw 'Packaged app timed out.'
+          }
+          if ($app.ExitCode -ne 0) { throw "Packaged app failed with exit code $($app.ExitCode)." }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Workaholic-windows-x64
+          path: dist/release/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: Workaholic-windows-x64
+          path: release
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" release/* --verify-tag --title "Workaholic $RELEASE_TAG" --notes-file docs/release-notes.md

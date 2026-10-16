@@ -96,7 +96,11 @@ When you close Workaholic, services it started are stopped. You can turn off the
 
 ## Configuration
 
-Services, groups and settings are saved in `services_config.json` next to the app. Configs from older versions are upgraded automatically, and a broken file is backed up before being replaced.
+Services, groups and settings are saved in `%APPDATA%\Workaholic\services_config.json` on Windows. You can open the location from **Settings**. On other platforms, the file is under `$XDG_CONFIG_HOME/Workaholic` (or `~/.config/Workaholic`).
+
+On first launch, an older `services_config.json` beside the EXE (or source script) is copied to AppData if no settings exist there. The old file is left untouched; an existing AppData config always takes priority. Configs from older versions are upgraded automatically, and a broken file is backed up before being replaced.
+
+To update, close Workaholic and replace the EXE. Settings stay in AppData. Keep the EXE at the same path if launch at sign-in is enabled. To move settings to another PC, copy the AppData config, and check any program paths stored inside it.
 
 The sign-in option adds a `Workaholic` entry under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`. Turning it off removes it.
 

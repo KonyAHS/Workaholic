@@ -8,6 +8,7 @@
 Start them in order, keep an eye on them, and have them launch with your game.
 
 [![GitHub stars](https://img.shields.io/github/stars/KonyAHS/Workaholic?style=flat&logo=github&color=32534b)](https://github.com/KonyAHS/Workaholic/stargazers)
+[![Release](https://img.shields.io/github/v/release/KonyAHS/Workaholic?color=32534b)](https://github.com/KonyAHS/Workaholic/releases/latest)
 [![Python](https://img.shields.io/badge/python-3.10%2B-32534b?logo=python&logoColor=white)](https://www.python.org/downloads/)
 [![Platform](https://img.shields.io/badge/platform-Windows-c9a46c?logo=windows&logoColor=white)](#quick-start)
 [![Last commit](https://img.shields.io/github/last-commit/KonyAHS/Workaholic?color=c9a46c)](https://github.com/KonyAHS/Workaholic/commits)
@@ -30,12 +31,24 @@ Start them in order, keep an eye on them, and have them launch with your game.
 
 ## Quick start
 
+1. Download **[Workaholic.exe](https://github.com/KonyAHS/Workaholic/releases/latest/download/Workaholic.exe)** from the latest release (Windows 10/11 x64).
+2. Put it in a permanent folder and open it. No Python installation or build is needed for Workaholic itself.
+3. Click **Add app / service**, pick a few programs, then group them from the sidebar.
+
+The [release page](https://github.com/KonyAHS/Workaholic/releases/latest) also has a portable ZIP, source ZIP and SHA-256 checksums.
+The EXE is unsigned, so Windows may show a SmartScreen warning.
+
+Settings are stored in `%APPDATA%\Workaholic\services_config.json`. An older config beside the EXE is copied there on first launch if no AppData config exists. To update, close Workaholic and replace the EXE; your settings stay in AppData. Keep the EXE at the same path if you use launch at sign-in.
+
+<details>
+<summary><b>Run from source</b></summary>
+
 ```powershell
 python -m pip install -r requirements.txt
 pythonw service_aggregator.py
 ```
 
-Click **Add app / service**, pick a few programs, then group them from the sidebar.
+</details>
 
 <details>
 <summary><b>Build the Windows executable</b></summary>
@@ -46,7 +59,7 @@ Click **Add app / service**, pick a few programs, then group them from the sideb
 powershell -ExecutionPolicy Bypass -File .\build.ps1
 ```
 
-This creates a single `Workaholic.exe` that runs without Python or a console window. Keep `services_config.json` next to it to bring your services and groups along. The previous build is kept as `Workaholic.previous-<date>.exe`.
+This creates a single `Workaholic.exe` that runs without Python or a console window. Settings are saved in AppData. The previous build is kept as `Workaholic.previous-<date>.exe`. See [Releasing](docs/releasing.md) for GitHub release instructions.
 
 </details>
 
@@ -105,4 +118,4 @@ The **[guide](docs/guide.md)** covers everything in detail: how groups start and
 
 Workaholic is made for my own use, but bug reports and suggestions are welcome.
 
-Run the tests with `python -m unittest test_services -v`.
+Run the tests with `python -m unittest discover -v`.
