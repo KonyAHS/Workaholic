@@ -79,6 +79,8 @@ This creates a single `Workaholic.exe` that runs without Python or a console win
 | `Del`     | Remove from Workaholic           |
 | `Ctrl+,`  | Settings                         |
 
+Each group can also have its own shortcut that starts it from any program. See the [guide](docs/guide.md#keyboard-shortcuts-for-groups).
+
 </details>
 
 <details>

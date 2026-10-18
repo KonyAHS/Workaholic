@@ -5,7 +5,7 @@ The **windows-x64.zip** includes the same EXE, a short guide and third-party not
 
 - Run and monitor scripts and programs in one window.
 - Group services and launch them in order, with delays.
-- Start groups when a game or app opens, or when Workaholic starts.
+- Start groups when a game or app opens, when Workaholic starts, or with a keyboard shortcut from any program.
 - View live output, choose service icons and avoid duplicate processes.
 - Optionally launch Workaholic when signing in to Windows.
 

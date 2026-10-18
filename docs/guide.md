@@ -55,6 +55,20 @@ Workaholic remembers the program's executable name, so next time it starts the g
 - The group starts once per session of the program. Closing the program leaves the group running. If you stop the group yourself, it stays stopped until the program is started again.
 - Avoid picking something that runs as `python.exe`: every Python program would then count as a match.
 
+## Keyboard shortcuts for groups
+
+A group can have its own shortcut that starts it from any program, even while Workaholic is minimized.
+
+1. Edit the group and click the **Keyboard shortcut** box.
+2. Press the keys you want, for example `Ctrl+Alt+1`, then save. Press `Backspace` in the box or click **Clear** to remove it.
+
+Some details:
+
+- A shortcut must include `Alt`, `Win` or `Ctrl+Shift`, so it can't take over keys like `Ctrl+C`. F-keys only need one modifier, and `F13`–`F24` work on their own.
+- Workaholic must be open for shortcuts to work.
+- If another program already uses the shortcut, or Windows reserves it (such as `Win+E`), Workaholic shows a message and the shortcut does nothing. Pick a different one.
+- The shortcut only starts the group. Services that are already running are left alone.
+
 ## Startup
 
 - Tick **Start on launch** on a group to start it when Workaholic opens. Groups start in sidebar order.

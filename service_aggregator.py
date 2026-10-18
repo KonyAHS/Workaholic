@@ -481,6 +481,100 @@ def visible_windows() -> list[tuple[int, str]]:
     return found
 
 
+# ---------- Global shortcuts ----------
+HOTKEY_MODS = (("Ctrl", 0x2), ("Alt", 0x1), ("Shift", 0x4), ("Win", 0x8))   # MOD_* flags, in display order
+HOTKEY_KEYS = {
+    **{chr(c): c for c in range(0x41, 0x5B)}, **{str(d): 0x30 + d for d in range(10)},
+    **{f"F{n}": 0x6F + n for n in range(1, 25)}, **{f"Num{d}": 0x60 + d for d in range(10)},
+    "NumMultiply": 0x6A, "NumPlus": 0x6B, "NumMinus": 0x6D, "NumDecimal": 0x6E, "NumDivide": 0x6F,
+    "Space": 0x20, "PageUp": 0x21, "PageDown": 0x22, "End": 0x23, "Home": 0x24, "Left": 0x25, "Up": 0x26,
+    "Right": 0x27, "Down": 0x28, "Insert": 0x2D, "Delete": 0x2E, "Pause": 0x13,
+    ";": 0xBA, "=": 0xBB, ",": 0xBC, "-": 0xBD, ".": 0xBE, "/": 0xBF, "`": 0xC0, "[": 0xDB, "\\": 0xDC,
+    "]": 0xDD, "'": 0xDE,
+}
+HOTKEY_NAMES = {vk: name for name, vk in HOTKEY_KEYS.items()}
+MODIFIER_VKS = {0x10, 0x11, 0x12, 0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5}
+
+
+def format_hotkey(mods: int, vk: int) -> str:
+    return "+".join([name for name, flag in HOTKEY_MODS if mods & flag] + [HOTKEY_NAMES[vk]])
+
+
+def parse_hotkey(spec: str) -> tuple[int, int] | None:
+    """(MOD_* flags, virtual key) for a shortcut such as "Ctrl+Alt+G", or None if it isn't usable.
+    Shortcuts need Alt, Win or Ctrl+Shift so they don't take over everyday keys such as Ctrl+C;
+    F-keys only need a modifier, and F13–F24 may stand alone."""
+    if not spec: return None
+    *mod_names, key = spec.split("+")
+    flags = {name.lower(): flag for name, flag in HOTKEY_MODS}
+    key = next((k for k in HOTKEY_KEYS if k.lower() == key.strip().lower()), None)
+    mods = 0
+    for name in mod_names:
+        flag = flags.get(name.strip().lower())
+        if flag is None: return None
+        mods |= flag
+    if key is None: return None
+    vk = HOTKEY_KEYS[key]
+    if 0x70 <= vk <= 0x87: usable = bool(mods) or vk >= 0x7C
+    else: usable = bool(mods & 0x9) or mods & 0x6 == 0x6
+    return (mods, vk) if usable else None
+
+
+class HotkeyListener:
+    """System-wide shortcuts that work while another program has focus. RegisterHotKey ties each shortcut
+    to the thread that registered it, so a small thread owns them and runs a message loop."""
+
+    def __init__(self, on_press):
+        self.on_press = on_press
+        self._thread: threading.Thread | None = None
+        self._thread_id = 0
+
+    def register(self, specs: list[str]) -> list[str]:
+        """Replace the active shortcuts; returns the ones Windows refused (usually taken by another app)."""
+        self.stop()
+        if not IS_WINDOWS or not specs: return []
+        result: dict[str, list[str]] = {}
+        ready = threading.Event()
+        self._thread = threading.Thread(target=self._run, args=(specs, ready, result), daemon=True)
+        self._thread.start()
+        ready.wait(5)
+        return result.get("failed", [])
+
+    def stop(self):
+        if self._thread and self._thread_id:
+            import ctypes
+            ctypes.windll.user32.PostThreadMessageW(self._thread_id, 0x0012, 0, 0)   # WM_QUIT
+            self._thread.join(2)
+        self._thread, self._thread_id = None, 0
+
+    def _run(self, specs: list[str], ready: threading.Event, result: dict):
+        import ctypes
+        from ctypes import wintypes as w
+        user32 = ctypes.WinDLL("user32")
+        user32.RegisterHotKey.argtypes = [w.HWND, ctypes.c_int, w.UINT, w.UINT]
+        user32.UnregisterHotKey.argtypes = [w.HWND, ctypes.c_int]
+        user32.GetMessageW.argtypes = [ctypes.POINTER(w.MSG), w.HWND, w.UINT, w.UINT]
+        user32.PeekMessageW.argtypes = [ctypes.POINTER(w.MSG), w.HWND, w.UINT, w.UINT, w.UINT]
+        msg = w.MSG()
+        user32.PeekMessageW(ctypes.byref(msg), None, 0x0400, 0x0400, 0)   # create the queue for WM_QUIT
+        self._thread_id = ctypes.windll.kernel32.GetCurrentThreadId()
+        registered, failed = [], []
+        for i, spec in enumerate(specs, 1):
+            parsed = parse_hotkey(spec)
+            if parsed and user32.RegisterHotKey(None, i, parsed[0] | 0x4000, parsed[1]):   # MOD_NOREPEAT
+                registered.append(i)
+            else:
+                failed.append(spec)
+        result["failed"] = failed
+        ready.set()
+        try:
+            while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                if msg.message == 0x0312 and 1 <= msg.wParam <= len(specs):   # WM_HOTKEY
+                    self.on_press(specs[msg.wParam - 1])
+        finally:
+            for i in registered: user32.UnregisterHotKey(None, i)
+
+
 class Service:
     _ids = itertools.count(1)
 
@@ -667,6 +761,7 @@ class Group:
     autostart: bool = False
     start_delay: float = 1.0                           # seconds between starting each service
     trigger_process: str = ""                         # executable name or full path; empty disables
+    hotkey: str = ""                                  # system-wide shortcut such as "Ctrl+Alt+1"
 
 
 @dataclass
@@ -966,6 +1061,39 @@ class SearchEntry(tk.Frame):
         self.entry.select_range(0, "end")
 
 
+class HotkeyEntry(ttk.Entry):
+    """Records a shortcut when it's pressed. Backspace or Delete on its own clears it."""
+
+    def __init__(self, parent, value: str, **kw):
+        self.var = tk.StringVar(parent, value=value)
+        super().__init__(parent, textvariable=self.var, **kw)
+        self.bind("<KeyPress>", self._key)
+
+    def get_spec(self) -> str: return self.var.get().strip()
+    def clear(self): self.var.set("")
+
+    @staticmethod
+    def _modifiers(e) -> int:
+        if not IS_WINDOWS:
+            return (2 if e.state & 0x4 else 0) | (1 if e.state & 0x8 else 0) | (4 if e.state & 0x1 else 0)
+        import ctypes
+        state = ctypes.WinDLL("user32").GetKeyState
+        state.restype = ctypes.c_short
+        down = lambda *vks: any(state(vk) & 0x8000 for vk in vks)
+        return (2 if down(0x11) else 0) | (1 if down(0x12) else 0) | (4 if down(0x10) else 0) | \
+            (8 if down(0x5B, 0x5C) else 0)
+
+    def _key(self, e):
+        mods = self._modifiers(e)
+        if e.keysym in ("Tab", "ISO_Left_Tab", "Escape") or (e.keysym == "Return" and not mods):
+            return None   # keep moving focus, cancelling and saving the dialog
+        if e.keysym in ("BackSpace", "Delete") and not mods:
+            self.clear()
+        elif e.keycode in HOTKEY_NAMES and e.keycode not in MODIFIER_VKS:
+            self.var.set(format_hotkey(mods, e.keycode))
+        return "break"
+
+
 # ---------- Dialogs ----------
 class Dialog(tk.Toplevel):
     def __init__(self, app: App, title: str, parent: tk.Misc | None = None):
@@ -1113,6 +1241,17 @@ class GroupDialog(Dialog):
         ttk.Entry(trigger_row, textvariable=self.trigger_var).pack(side="left", fill="x", expand=True)
         ttk.Button(trigger_row, text="Pick running app…", command=self._pick_trigger).pack(side="left", padx=(px(8), 0))
         ttk.Button(trigger_row, text="Browse…", command=self._browse_trigger).pack(side="left", padx=(px(8), 0))
+        hotkey_row = self.field("Keyboard shortcut",
+                                "Click the box and press keys such as Ctrl+Alt+1 to start this group from any "
+                                "program. Workaholic must stay open; it can be minimized." if IS_WINDOWS
+                                else "Available on Windows only.")
+        self.hotkey_entry = HotkeyEntry(hotkey_row, group.hotkey if group else "")
+        self.hotkey_entry.pack(side="left", fill="x", expand=True)
+        clear = ttk.Button(hotkey_row, text="Clear", command=self.hotkey_entry.clear)
+        clear.pack(side="left", padx=(px(8), 0))
+        if not IS_WINDOWS:
+            self.hotkey_entry.state(["disabled"])
+            clear.state(["disabled"])
         delay_row = tk.Frame(self.body, bg=C.BG)
         delay_row.pack(fill="x", pady=(px(10), 0))
         tk.Label(delay_row, text="Wait", fg=C.TEXT, bg=C.BG, font=app.f_base).pack(side="left")
@@ -1174,9 +1313,15 @@ class GroupDialog(Dialog):
             if not 0 <= delay <= 600: raise ValueError
         except ValueError:
             return self.fail("The delay must be a number between 0 and 600 seconds.")
+        hotkey = self.hotkey_entry.get_spec()
+        if hotkey and not parse_hotkey(hotkey):
+            return self.fail("Include Alt, Win or Ctrl+Shift in the shortcut, or use an F-key.")
+        other = next((g for g in self.app.groups if hotkey and g is not self.group and g.hotkey == hotkey), None)
+        if other:
+            return self.fail(f"{hotkey} already starts “{other.name}”.")
         return Group(name=name, services=[s.path for s in self.order if s.id in self.checked],
                      autostart=self.autostart_var.get(), start_delay=delay,
-                     trigger_process=self.trigger_var.get().strip().strip('"'))
+                     trigger_process=self.trigger_var.get().strip().strip('"'), hotkey=hotkey)
 
 
 class AddServiceDialog(Dialog):
@@ -1631,6 +1776,8 @@ class App(tk.Tk):
         self._process_scan_pending = False
         self._trigger_states: dict[int, tuple[str, bool]] = {}
         self._group_restart_tokens: dict[int, object] = {}
+        self._hotkeys = HotkeyListener(lambda spec: self._ui_queue.put("hotkey:" + spec))
+        self._hotkey_specs: list[str] = []
         self._icons: dict[tuple[str, int], tk.PhotoImage | None] = {}
         self._fallback_icons: dict[int, tk.PhotoImage] = {}
         self._service_icons: dict[tuple[str, str, str], tk.PhotoImage] = {}
@@ -1662,6 +1809,8 @@ class App(tk.Tk):
             if self.settings.maximized: self._maximize()
         if self._config_warning:
             self.flash(self._config_warning, "error", sticky=True)
+        if not getattr(opts, "smoke_test", False):
+            self._apply_hotkeys()
         self.after(TICK_MS, self._tick)
         if not opts.no_autostart and any(g.autostart for g in self.groups):
             delay = self.settings.autostart_delay
@@ -2148,6 +2297,7 @@ class App(tk.Tk):
             parts = [f"{r} of {len(members)} running" if members else "No services in this group"]
             if g.autostart: parts.append("starts on launch")
             if g.trigger_process: parts.append(f"starts with {Path(g.trigger_process).name}")
+            if g.hotkey: parts.append(f"shortcut {g.hotkey}")
             if len(members) > 1: parts.append(f"{g.start_delay:g}s between services")
             sub = "  ·  ".join(parts)
         elif kind == "running":
@@ -2318,7 +2468,7 @@ class App(tk.Tk):
         idx = self.groups.index(g)
         var = tk.BooleanVar(m, value=g.autostart)
         self._menu_vars = [var]
-        m.add_command(label="Start group", command=lambda: self.start_group(g))
+        m.add_command(label="Start group", accelerator=g.hotkey, command=lambda: self.start_group(g))
         m.add_command(label="Stop group", command=lambda: self.stop_group(g))
         m.add_command(label="Restart all in group", command=lambda: self.restart_group(g))
         m.add_separator()
@@ -2507,13 +2657,14 @@ class App(tk.Tk):
         self.render_sidebar()
         self.set_view("group", g)
         self.flash(f"Created group “{g.name}”", "ok")
+        self._apply_hotkeys()
 
     def edit_group(self, g: Group):
         result = GroupDialog(self, g).show()
         if not result: return
         g.name, g.services, g.autostart, g.start_delay = (result.name, result.services, result.autostart,
                                                          result.start_delay)
-        g.trigger_process = result.trigger_process
+        g.trigger_process, g.hotkey = result.trigger_process, result.hotkey
         self._save_config()
         self.render_sidebar()
         if self.view[1] is g: self._render_header()
@@ -2532,6 +2683,7 @@ class App(tk.Tk):
         if self.view[1] is g: self.set_view("all")
         else: self._refresh()
         self.flash(f"Deleted group “{g.name}”", "ok")
+        self._apply_hotkeys()
 
     def move_group(self, g: Group, delta: int):
         i = self.groups.index(g)
@@ -2560,12 +2712,12 @@ class App(tk.Tk):
         self.flash(f"{'Added' if include else 'Removed'} {self._names(services)} "
                    f"{'to' if include else 'from'} “{g.name}”", "ok")
 
-    def start_group(self, g: Group):
+    def start_group(self, g: Group, interactive: bool = True):
         members = self.group_services(g)
         if not members:
             self.flash(f"“{g.name}” has no services yet.", "warn")
             return
-        self._start_sequence([(s, g.start_delay) for s in members], f"“{g.name}”", interactive=True)
+        self._start_sequence([(s, g.start_delay) for s in members], f"“{g.name}”", interactive=interactive)
 
     def stop_group(self, g: Group):
         self._group_restart_tokens.pop(id(g), None)
@@ -2616,6 +2768,20 @@ class App(tk.Tk):
                     seen.add(s.id)
                     items.append((s, g.start_delay))
         if items: self._start_sequence(items, "Process startup: " + ", ".join(names))
+
+    def _apply_hotkeys(self):
+        specs = [g.hotkey for g in self.groups if g.hotkey]
+        if specs == self._hotkey_specs: return
+        self._hotkey_specs = specs
+        failed = self._hotkeys.register(specs)
+        if failed:
+            self.flash(f"Couldn't use the shortcut {', '.join(failed)}. Another program may already use it.",
+                       "error", sticky=True)
+
+    def _on_hotkey(self, spec: str):
+        g = next((g for g in self.groups if g.hotkey == spec), None)
+        if g and not self._closing:
+            self.start_group(g, interactive=False)   # no error dialogs: the user is in another program
 
     def run_autostart(self):
         seen, items, names = set(), [], []
@@ -2823,6 +2989,7 @@ class App(tk.Tk):
             try: msg = self._ui_queue.get_nowait()
             except queue.Empty: return
             if msg == "show": self._show_window()
+            elif msg.startswith("hotkey:"): self._on_hotkey(msg.removeprefix("hotkey:"))
 
     def _listen(self, sock: socket.socket):
         while True:
@@ -2891,7 +3058,8 @@ class App(tk.Tk):
             self.groups.append(Group(name=str(entry["name"]),
                                      services=[p for p in entry.get("services", []) or [] if isinstance(p, str)],
                                      autostart=bool(entry.get("autostart", False)), start_delay=delay,
-                                     trigger_process=str(entry.get("trigger_process") or "")))
+                                     trigger_process=str(entry.get("trigger_process") or ""),
+                                     hotkey=str(entry.get("hotkey") or "")))
 
         raw_settings = data.get("settings", {}) or {}
         for f in fields(Settings):
@@ -2950,6 +3118,7 @@ class App(tk.Tk):
 
     def destroy(self):
         self._destroyed = True
+        self._hotkeys.stop()
         if self._instance_sock:
             try: self._instance_sock.close()
             except OSError: pass

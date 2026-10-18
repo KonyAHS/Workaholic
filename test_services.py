@@ -6,8 +6,9 @@ from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from service_aggregator import (App, Group, Service, icon_sources, matching_process, parse_icon_spec, png_bytes,
-                                process_snapshot, program_choices, trigger_process_running)
+from service_aggregator import (App, Group, Service, format_hotkey, icon_sources, matching_process, parse_hotkey,
+                                parse_icon_spec, png_bytes, process_snapshot, program_choices,
+                                trigger_process_running)
 
 
 class GroupChecks(unittest.TestCase):
@@ -70,6 +71,34 @@ class GroupChecks(unittest.TestCase):
         first.is_active = False
         resume()
         app._start_sequence.assert_not_called()
+
+
+class HotkeyChecks(unittest.TestCase):
+    def test_shortcuts_round_trip_and_reject_everyday_keys(self):
+        self.assertEqual(parse_hotkey("Ctrl+Alt+G"), (0x3, 0x47))
+        self.assertEqual(format_hotkey(*parse_hotkey("alt+ctrl+1")), "Ctrl+Alt+1")
+        self.assertEqual(format_hotkey(*parse_hotkey("Win+Shift+NumPlus")), "Shift+Win+NumPlus")
+        for usable in ("Alt+F4", "Ctrl+Shift+S", "Ctrl+F5", "F13", "Win+`"):
+            self.assertIsNotNone(parse_hotkey(usable), usable)
+        for unusable in ("", "G", "Ctrl+C", "Shift+A", "F5", "Ctrl+Alt+", "Hyper+G", "Ctrl+Alt+Enter"):
+            self.assertIsNone(parse_hotkey(unusable), unusable)
+
+    def test_shortcut_starts_its_group_without_dialogs(self):
+        group = Group("Work", hotkey="Ctrl+Alt+W")
+        app = SimpleNamespace(groups=[Group("Other"), group], _closing=False, start_group=Mock())
+        App._on_hotkey(app, "Ctrl+Alt+W")
+        app.start_group.assert_called_once_with(group, interactive=False)
+        App._on_hotkey(app, "Ctrl+Alt+X")
+        app.start_group.assert_called_once()
+
+    def test_unchanged_shortcuts_are_not_registered_again(self):
+        listener = Mock(register=Mock(return_value=["Win+E"]))
+        app = SimpleNamespace(groups=[Group("A", hotkey="Win+E"), Group("B")], _hotkey_specs=[],
+                              _hotkeys=listener, flash=Mock())
+        App._apply_hotkeys(app)
+        App._apply_hotkeys(app)
+        listener.register.assert_called_once_with(["Win+E"])
+        self.assertIn("Win+E", app.flash.call_args.args[0])
 
 
 class ProcessChecks(unittest.TestCase):
